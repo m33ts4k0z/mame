@@ -1091,7 +1091,10 @@ Notes:
 #include "cpu/m68000/m68020.h"
 #include "cpu/tms320c2x/tms320c2x.h"
 
+#include "render.h"
 #include "speaker.h"
+
+#include "namcos22.lh"
 
 // 51.2MHz XTAL on video board, pixel clock of 12.8MHz (doubled in MAME because of unemulated interlacing)
 // HSync - 15.7248 kHz -> htotal = 814.001
@@ -1906,6 +1909,17 @@ u16 timecris_state::gun_r(offs_t offset)
 	const u16 ymax = m_opt[1]->field(0xffff)->maxval();
 	if (xpos == xmin || xpos == xmax || ypos == ymin || ypos == ymax)
 		xpos = ypos = 0;
+	else if (m_render_wide)
+	{
+		// widescreen: MAME spreads the gun over the whole 16:9 screen, the game aims in the 4:3
+		// middle; the sides are off-screen
+		const float mid = (xmin + xmax) * 0.5f;
+		const int x = std::lround(mid + (xpos - mid) * float(HBSTART + 2 * WIDE_EXTRA) / HBSTART);
+		if (x <= xmin || x >= xmax)
+			xpos = ypos = 0;
+		else
+			xpos = x;
+	}
 
 	switch (offset)
 	{
@@ -2618,7 +2632,10 @@ void namcos22_state::iomcu_s22_program(address_map &map)
 
 TIMER_DEVICE_CALLBACK_MEMBER(namcos22s_state::mcu_irq)
 {
-	const int scanline = param;
+	// in 640x480 lines, whatever the render scale
+	if (param % m_render_scale)
+		return;
+	const int scanline = param / m_render_scale;
 
 	/* TODO: real sources of these */
 	if (scanline == 480)
@@ -3608,6 +3625,19 @@ static INPUT_PORTS_START( timecris )
 	PORT_BIT( 0xff00ffff, IP_ACTIVE_LOW, IPT_UNUSED )
 
 	// Dev pad: display-test library reader 0xb4bf6 only (called from 0xb34e6 through the SW4:4 check at 0xb4bd2).
+
+	PORT_START("RENDER") // enhancements, not hardware; applied on reset (same bits as namcos23.cpp)
+	PORT_CONFNAME( 0x03, 0x00, "Internal Resolution" )
+	PORT_CONFSETTING(    0x00, "1x (640x480, original)" )
+	PORT_CONFSETTING(    0x01, "2x (1280x960)" )
+	PORT_CONFSETTING(    0x02, "3x (1920x1440)" )
+	PORT_CONFSETTING(    0x03, "4x (2560x1920)" )
+	PORT_CONFNAME( 0x20, 0x00, "Gamma Ramp" )
+	PORT_CONFSETTING(    0x00, "Game (MAME)" )
+	PORT_CONFSETTING(    0x20, "Off (darker)" )
+	PORT_CONFNAME( 0x80, 0x00, "Aspect Ratio" )
+	PORT_CONFSETTING(    0x00, "4:3 (original)" )
+	PORT_CONFSETTING(    0x80, "16:9 (widescreen)" )
 INPUT_PORTS_END
 
 
@@ -3648,8 +3678,73 @@ static GFXDECODE_START( gfx_super )
 GFXDECODE_END
 
 
+void namcos22_state::apply_render_settings()
+{
+	if (!m_render_cfg)
+		return;
+
+	const ioport_value cfg = m_render_cfg->read();
+	int scale = (cfg & 0x03) + 1;
+	bool gamma = !BIT(cfg, 5);
+	bool wide = BIT(cfg, 7);
+
+	// environment overrides, for scripted comparisons
+	if (const char *const env = getenv("MAME_S22_SCALE"))
+		scale = std::clamp(atoi(env), 1, 4);
+	if (const char *const env = getenv("MAME_S22_NOGAMMA"))
+		gamma = atoi(env) == 0;
+	if (const char *const env = getenv("MAME_S22_WIDE"))
+		wide = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S22_ENHANCED"))
+		m_render_force = atoi(env) != 0;
+
+	m_render_gamma = gamma;
+	if (scale != m_render_scale || wide != m_render_wide)
+	{
+		// same frame time, scale times as many lines and pixels; widescreen adds WIDE_EXTRA
+		// pixels on each side (and a longer line, so they fit)
+		m_render_scale = scale;
+		m_render_wide = wide;
+		const int extra = wide ? WIDE_EXTRA : 0;
+		const int width = (HBSTART + 2 * extra) * scale;
+		m_render_wide_ofs = extra * scale;
+		const rectangle visarea(HBEND * scale, HBEND * scale + width - 1, VBEND * scale, VBSTART * scale - 1);
+		m_screen->configure((wide ? 2 * HTOTAL : HTOTAL) * scale, VTOTAL * scale, visarea, m_native_frame_period);
+
+		// text layer column of each screen column
+		m_render_xmap.resize(width);
+		for (int x = 0; x < width; x++)
+		{
+			const int nx = x - m_render_wide_ofs;
+			m_render_xmap[x] = (nx >= 0 && nx < HBSTART * scale) ? nx / scale : NO_PEN;
+		}
+	}
+
+	// the window follows the screen shape: pick the matching view of namcos22.lay when a view
+	// of the other shape is shown (MAME's own "Screen 0 Standard (4:3)" counts as 4:3), so
+	// other views that were chosen on purpose stay
+	const char *const view = wide ? "Widescreen (16:9)" : "Standard (4:3)";
+	const char *const other = wide ? "Standard (4:3)" : "Widescreen (16:9)";
+	for (render_target &target : machine().render().targets())
+	{
+		const char *const current = target.view_name(target.view());
+		if (!current || !strstr(current, other))
+			continue;
+		for (unsigned i = 0; target.view_name(i); i++)
+		{
+			if (!strcmp(target.view_name(i), view))
+			{
+				target.set_view(i);
+				break;
+			}
+		}
+	}
+}
+
 void namcos22_state::machine_reset()
 {
+	apply_render_settings();
+
 	master_enable(false);
 	slave_enable(false);
 	m_dsp_irq_enabled = false;
@@ -3663,6 +3758,7 @@ ALLOW_SAVE_TYPE(namcos22_dsp_upload_state);
 void namcos22_state::machine_start()
 {
 	m_dsp_upload_state = NAMCOS22_DSP_UPLOAD_READY;
+	m_native_frame_period = m_screen->frame_period();
 
 	// register for savestates, stuff that isn't done in video_start()
 	// note: namcos22_renderer class doesn't need saving, it is refreshed every frame
@@ -3929,6 +4025,7 @@ void timecris_state::timecris(machine_config &config)
 	namcos22s(config);
 
 	m_maincpu->set_addrmap(AS_PROGRAM, &timecris_state::timecris_am);
+	config.set_default_layout(layout_namcos22); // 4:3 and 16:9 views for the Aspect Ratio setting
 }
 
 void namcos22s_state::tokyowar(machine_config &config)

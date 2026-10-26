@@ -15,7 +15,7 @@
 // poly constructor
 
 namcos22_renderer::namcos22_renderer(namcos22_state &state) :
-	poly_manager<poly3d_t, namcos22_object_data, 4>(state.machine()),
+	poly_manager<poly3d_t, namcos22_object_data, 4, POLY_FLAG_NO_WORK_QUEUE>(state.machine()),
 	m_state(state)
 	{
 		init();
@@ -301,6 +301,21 @@ void namcos22_renderer::poly3d_drawquad(screen_device &screen, bitmap_rgb32 &bit
 	const int cx = 320 + node->data.quad.vx;
 	const int cy = 240 + node->data.quad.vy;
 	m_cliprect.set(cx + node->data.quad.vl, cx - node->data.quad.vr - 1, cy + node->data.quad.vu, cy - node->data.quad.vd - 1);
+	const int scale = m_state.m_render_scale;
+	const int ofs = m_state.m_render_wide_ofs;
+	if (scale != 1 || ofs)
+	{
+		// at the render scale; widescreen: the 4:3 picture moves right by ofs, and a scene as
+		// wide as the 4:3 screen widens to the whole screen
+		const bool full_width = ofs && m_cliprect.left() <= 0 && m_cliprect.right() >= 639;
+		m_cliprect.set(m_cliprect.left() * scale + ofs, (m_cliprect.right() + 1) * scale - 1 + ofs,
+				m_cliprect.top() * scale, (m_cliprect.bottom() + 1) * scale - 1);
+		if (full_width)
+		{
+			m_cliprect.min_x = screen.visible_area().left();
+			m_cliprect.max_x = screen.visible_area().right();
+		}
+	}
 	m_cliprect &= screen.visible_area();
 
 	// non-direct case: project and z-clip
@@ -349,13 +364,23 @@ void namcos22_renderer::poly3d_drawquad(screen_device &screen, bitmap_rgb32 &bit
 		}
 	}
 
+	// screen coordinates at the render scale (texture and shading parameters are unchanged)
+	if (scale != 1 || ofs)
+	{
+		for (vertnum = 0; vertnum < clipverts; vertnum++)
+		{
+			clipv[vertnum].x = clipv[vertnum].x * scale + ofs;
+			clipv[vertnum].y *= scale;
+		}
+	}
+
 	const int color = node->data.quad.color;
 	const int cz_value = node->data.quad.cz_value;
 	const int cz_type = node->data.quad.cz_type;
 	const int cz_adjust = node->data.quad.cz_adjust;
 	const int objectflags = node->data.quad.objectflags;
 
-	namcos22_object_data &extra = object_data().next();
+	namcos22_object_data extra{};
 
 	extra.destbase = &bitmap;
 	extra.pfade_enabled = false;
@@ -447,9 +472,9 @@ void namcos22_renderer::poly3d_drawquad(screen_device &screen, bitmap_rgb32 &bit
 	}
 
 	if (m_state.m_is_ss22)
-		dispatch_scanline_poly(&namcos22_renderer::renderscanline_poly_ss22, clipverts, clipv);
+		add_prepared(extra, &namcos22_renderer::renderscanline_poly_ss22, false, clipverts, clipv);
 	else
-		dispatch_scanline_poly(&namcos22_renderer::renderscanline_poly, clipverts, clipv);
+		add_prepared(extra, &namcos22_renderer::renderscanline_poly, false, clipverts, clipv);
 }
 
 
@@ -479,7 +504,7 @@ void namcos22_renderer::poly3d_drawsprite(
 		const poly3d_t fsw = sprite_screen_width;
 		const poly3d_t fsh = sprite_screen_height;
 
-		namcos22_object_data &extra = object_data().next();
+		namcos22_object_data extra{};
 		vertex_t vert[4];
 
 		extra.fadefactor = 0;
@@ -510,6 +535,18 @@ void namcos22_renderer::poly3d_drawsprite(
 		vert[3].p[0] = 0;
 		vert[3].p[1] = fheight;
 
+		// at the render scale, in the 4:3 middle of a widescreen
+		const int scale = m_state.m_render_scale;
+		const int ofs = m_state.m_render_wide_ofs;
+		if (scale != 1 || ofs)
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				vert[i].x = vert[i].x * scale + ofs;
+				vert[i].y *= scale;
+			}
+		}
+
 		// global fade
 		if (BIT(m_state.m_mixer_flags, 1) || fade_enabled)
 		{
@@ -528,7 +565,7 @@ void namcos22_renderer::poly3d_drawsprite(
 		extra.alpha = alpha;
 		extra.alpha_enabled = (color & 0x7f) != m_state.m_poly_alpha_color;
 
-		render_polygon<4, 2>(m_cliprect, render_delegate(&namcos22_renderer::renderscanline_sprite, this), vert);
+		add_prepared(extra, &namcos22_renderer::renderscanline_sprite, true, 4, vert);
 	}
 }
 
@@ -536,6 +573,13 @@ void namcos22_renderer::render_sprite(screen_device &screen, bitmap_rgb32 &bitma
 {
 	// scene clip
 	m_cliprect.set(node->data.sprite.cx_min, node->data.sprite.cx_max, node->data.sprite.cy_min, node->data.sprite.cy_max);
+	const int scale = m_state.m_render_scale;
+	const int ofs = m_state.m_render_wide_ofs;
+	if (scale != 1 || ofs)
+	{
+		m_cliprect.set(m_cliprect.left() * scale + ofs, (m_cliprect.right() + 1) * scale - 1 + ofs,
+				m_cliprect.top() * scale, (m_cliprect.bottom() + 1) * scale - 1);
+	}
 	m_cliprect &= screen.visible_area();
 
 	int offset = 0;
@@ -672,8 +716,58 @@ void namcos22_renderer::render_scene_nodes(screen_device &screen, bitmap_rgb32 &
 	}
 }
 
+void namcos22_renderer::add_prepared(const namcos22_object_data &extra, scanline_func func, bool sprite, int count, const vertex_t *v)
+{
+	if (m_cliprect.empty())
+		return;
+
+	prepared_t &item = m_prepared.emplace_back();
+	item.extra = extra;
+	item.func = func;
+	item.sprite = sprite;
+	item.clip = m_cliprect;
+	item.count = count;
+	poly3d_t miny = v[0].y, maxy = v[0].y;
+	for (int i = 0; i < count; i++)
+	{
+		item.v[i] = v[i];
+		miny = std::min(miny, v[i].y);
+		maxy = std::max(maxy, v[i].y);
+	}
+	// (near-plane clipped polys can reach far beyond the screen: clamp before converting)
+	const poly3d_t top = m_cliprect.top(), bottom = m_cliprect.bottom();
+	item.miny = s32(std::clamp(std::floor(miny) - 1, top, bottom));
+	item.maxy = s32(std::clamp(std::ceil(maxy) + 1, top, bottom));
+}
+
+void namcos22_renderer::render_band(const std::vector<prepared_t> &items, s32 min_y, s32 max_y)
+{
+	for (const prepared_t &item : items)
+	{
+		if (item.maxy < min_y || item.miny > max_y)
+			continue;
+
+		// the item's clip, within this band's rows
+		m_cliprect = item.clip;
+		m_cliprect.min_y = std::max(m_cliprect.min_y, min_y);
+		m_cliprect.max_y = std::min(m_cliprect.max_y, max_y);
+		if (m_cliprect.empty())
+			continue;
+
+		object_data().next() = item.extra;
+		if (item.sprite)
+			render_polygon<4, 2>(m_cliprect, render_delegate(item.func, this), item.v);
+		else
+			dispatch_scanline_poly(item.func, item.count, item.v);
+	}
+
+	// no work queue: this draws the band's queued scanlines on this thread
+	wait("render_band");
+}
+
 void namcos22_renderer::render_scene(screen_device &screen, bitmap_rgb32 &bitmap)
 {
+	m_prepared.clear();
 	struct namcos22_scenenode *node = &m_scenenode_root;
 	for (int i = NAMCOS22_RADIX_BUCKETS - 1; i >= 0; i--)
 	{
@@ -681,7 +775,39 @@ void namcos22_renderer::render_scene(screen_device &screen, bitmap_rgb32 &bitmap
 		node->data.nonleaf.next[i] = nullptr;
 	}
 
-	wait("render_scene");
+	m_state.render_bands(m_prepared, screen.visible_area());
+}
+
+void namcos22_state::render_bands(const std::vector<namcos22_renderer::prepared_t> &items, const rectangle &visarea)
+{
+	if (items.empty())
+		return;
+
+	// bands of about 8 rows, many more than threads, so threads that finish early take over the rest
+	const int rows = visarea.height();
+	const int count = std::max(rows / 8, 1);
+	m_band_jobs.resize(count);
+	for (int i = 0; i < count; i++)
+	{
+		render_band_job &job = m_band_jobs[i];
+		job.state = this;
+		job.items = &items;
+		job.min_y = visarea.top() + rows * i / count;
+		job.max_y = visarea.top() + rows * (i + 1) / count - 1;
+	}
+	osd_work_item_queue_multiple(m_pass_queue, render_band_work, count, &m_band_jobs[0], sizeof(render_band_job), WORK_ITEM_FLAG_AUTO_RELEASE);
+
+	// see namcos22s_state::run_screen_pass
+	while (!osd_work_queue_wait(m_pass_queue, osd_ticks_per_second() * 10)) { }
+}
+
+void *namcos22_state::render_band_work(void *param, int threadid)
+{
+	// threadid: 0 to the queue's thread count, the waiting thread being the last
+	const render_band_job &job = *(const render_band_job *)param;
+	auto &renderers = job.state->m_poly_threads;
+	renderers[std::clamp<int>(threadid, 0, renderers.size() - 1)]->render_band(*job.items, job.min_y, job.max_y);
+	return nullptr;
 }
 
 
@@ -1910,11 +2036,12 @@ void namcos22_state::posirq_update()
 {
 	int scanline = 2 * m_tilemapattr[4];
 
-	// schedule next timeout
-	if (scanline < m_screen->height())
+	// schedule next timeout (in 640x480 lines, whatever the render scale)
+	const int height = m_screen->height() / m_render_scale;
+	if (scanline < height)
 	{
-		scanline = (scanline + 480) % m_screen->height(); // 0 = vblank start
-		m_posirq_timer->adjust(m_screen->time_until_pos(scanline));
+		scanline = (scanline + 480) % height; // 0 = vblank start
+		m_posirq_timer->adjust(m_screen->time_until_pos(scanline * m_render_scale));
 	}
 	else
 		m_posirq_timer->adjust(attotime::never);
@@ -2199,7 +2326,7 @@ void namcos22_state::update_text_rowscroll()
 	}
 
 	const int scroll_x = (m_tilemapattr[0] - 0x35c) & 0x3ff;
-	const int y = std::min(m_screen->vpos(), 480);
+	const int y = std::min(native_vpos(), 480);
 
 	// save x scroll value until current scanline
 	for (int i = m_lastrow; i < y; i++)
@@ -2528,8 +2655,276 @@ void namcos22_state::update_mixer()
 
 /*********************************************************************************************/
 
+void namcos22s_state::prepare_text_mix()
+{
+	// as namcos22s_mix_text_layer
+	text_mix_t &m = m_text_mix;
+	m.alpha_check12 = nthbyte(m_mixer, 0x12);
+	m.alpha_check13 = nthbyte(m_mixer, 0x13);
+	m.alpha_mask    = nthbyte(m_mixer, 0x14) & 0xf;
+	m.alpha_factor  = nthbyte(m_mixer, 0x15);
+	m.spot_enabled = BIT(m_spotram_enable, 0) && (m_chipselect & 0xc000);
+	m.spot_factor = (m_spot_factor < 0x100) ? 0 : m_spot_factor & 0xff;
+	m.spot_palbase = m_text_palbase >> 8 & 3;
+	m.fade_enabled = BIT(m_mixer_flags, 1) && m_screen_fade_factor;
+	m.fade_factor = 0xff - m_screen_fade_factor;
+	m.fade_color.set(0, m_screen_fade_r, m_screen_fade_g, m_screen_fade_b);
+}
+
+// one text pixel over dst, as namcos22s_mix_text_layer draws it; false when dst stays as it is
+inline bool namcos22s_state::mix_text_pixel(u16 src, u32 &dst, int prival) const
+{
+	const text_mix_t &m = m_text_mix;
+	const pen_t *pens = m_palette->pens();
+	u8 pen;
+	rgbaint_t rgb;
+
+	if (m.spot_enabled)
+	{
+		// remap pen
+		pen = m_spotram[(src << 2 | m.spot_palbase) & 0x3ff];
+		if (pen < 0x80)
+			rgb.set(pens[pen | m_text_palbase]);
+		else if (prival != 6)
+			return false;
+	}
+	else
+	{
+		rgb.set(pens[src]);
+		pen = src;
+	}
+
+	// spot pen becomes brightness factor
+	if (m.spot_enabled && pen >= 0x80)
+	{
+		rgb.set(rgbaint_t(dst));
+		u16 factor = (m.spot_factor * (pen & 0x7f)) >> 7;
+		rgb.scale_imm_and_clamp(0x100 - factor);
+	}
+	else
+	{
+		if (m.fade_enabled)
+			rgb.blend(m.fade_color, m.fade_factor);
+		if (m.alpha_factor && ((pen & 0xf) == m.alpha_mask || (pen >= m.alpha_check12 && pen <= m.alpha_check13)))
+			rgb.blend(rgbaint_t(dst), 0xff - m.alpha_factor);
+	}
+
+	dst = rgb.to_rgba();
+	return true;
+}
+
+// Widescreen: on rows the text layer covers from edge to edge (bars, full-screen text pages),
+// both sides continue in one pen from the outermost 16 columns, per tile row: a tile row of one
+// pen there uses it, one with letters at the edges uses the nearest one-pen tile row of the
+// same block of covered rows, failing that its most common pen (at least half), kept from frame
+// to frame while it still covers a quarter (as in namcos23.cpp extend_text_rows).
+void namcos22s_state::extend_text_rows()
+{
+	struct block_t
+	{
+		u32 y0, y1;
+		bool covered;
+		int n;
+		u16 pens[16];
+		u32 counts[16];
+		u32 share(u16 pen) const { const int i = std::find(pens, pens + n, pen) - pens; return (i < n) ? counts[i] : 0U; }
+	};
+	std::array<block_t, 32> blocks;
+
+	// blocks follow the tile rows, which the vertical scroll moves
+	const u32 first = (16 - (m_tilemapattr[1] & 15)) & 15;
+	int count = 0;
+	for (u32 y0 = 0; y0 < 480; count++)
+	{
+		block_t &b = blocks[count];
+		b.y0 = y0;
+		b.y1 = std::min((y0 < first) ? first : y0 + 16, 480U);
+		b.covered = true;
+		for (u32 y = b.y0; y < b.y1 && b.covered; y++)
+		{
+			const u16 *const row = &m_mix_bitmap->pix(y);
+			b.covered = std::find(row, row + 640, NO_PEN) == row + 640;
+		}
+
+		// pens of the edge columns (a block has only a few)
+		b.n = 0;
+		for (u32 y = b.y0; y < b.y1 && b.covered; y++)
+		{
+			const u16 *const row = &m_mix_bitmap->pix(y);
+			for (int c = 0; c < 32; c++)
+			{
+				const u16 pen = row[(c < 16) ? c : 640 - 32 + c];
+				int i = 0;
+				while (i < b.n && b.pens[i] != pen)
+					i++;
+				if (i == b.n)
+				{
+					if (b.n == 16)
+						continue;
+					b.pens[b.n] = pen;
+					b.counts[b.n++] = 0;
+				}
+				b.counts[i]++;
+			}
+		}
+		y0 = b.y1;
+	}
+
+	for (int k = 0; k < count; k++)
+	{
+		const block_t &b = blocks[k];
+		u16 &kept = m_text_side_pen[k];
+		if (!b.covered)
+		{
+			kept = NO_PEN;
+			continue;
+		}
+
+		const u32 total = (b.y1 - b.y0) * 32;
+		int solid = -1, below = -1;
+		for (int j = k; j >= 0 && blocks[j].covered && solid < 0; j--)
+			if (blocks[j].n == 1)
+				solid = j;
+		for (int j = k + 1; j < count && blocks[j].covered && below < 0; j++)
+			if (blocks[j].n == 1)
+				below = j;
+		if (below >= 0 && (solid < 0 || below - k < k - solid))
+			solid = below;
+		if (solid >= 0)
+			kept = blocks[solid].pens[0];
+		else if (b.share(kept) * 4 < total)
+		{
+			const int best = std::max_element(b.counts, b.counts + b.n) - b.counts;
+			kept = (b.counts[best] * 2 >= total) ? b.pens[best] : NO_PEN;
+		}
+		std::fill(&m_text_side_row_pen[b.y0], &m_text_side_row_pen[b.y1], kept);
+	}
+}
+
+void *namcos22s_state::screen_pass_work(void *param, int threadid)
+{
+	const screen_pass_band &band = *(const screen_pass_band *)param;
+	band.state->screen_pass(band);
+	return nullptr;
+}
+
+void namcos22s_state::screen_pass(const screen_pass_band &band)
+{
+	// the text layer stays 640x480 and is scaled up here
+	const int scale = m_render_scale;
+	const u8 *rlut = (const u8 *)&m_mixer[0x100/4];
+	const u8 *glut = (const u8 *)&m_mixer[0x200/4];
+	const u8 *blut = (const u8 *)&m_mixer[0x300/4];
+	for (int y = band.min_y; y <= band.max_y; y++)
+	{
+		u32 *const dst = &band.bitmap->pix(y);
+		u8 *const pri = &band.pri->pix(y);
+		u16 const *const text = &m_mix_bitmap->pix(y / scale);
+		const u16 side = m_text_side_row_pen[y / scale];
+		for (int x = band.min_x; x <= band.max_x; x++)
+		{
+			const u16 nx = m_render_xmap[x];
+			const u16 pen = (nx != NO_PEN) ? text[nx] : side;
+			if (band.mode == PASS_BACKGROUND)
+			{
+				// background color, text priority, and text that is not under a poly/sprite
+				dst[x] = m_pass_bgcolor;
+				pri[x] = 0;
+				if (m_pass_text && pen != NO_PEN)
+				{
+					pri[x] = 4;
+					mix_text_pixel(pen, dst[x], 4);
+				}
+			}
+			else
+			{
+				// text over poly/sprite, then gamma (can be switched off)
+				if (m_pass_text && pri[x] == 6)
+					mix_text_pixel(pen, dst[x], 6);
+				if (m_render_gamma)
+				{
+					const u32 rgb = dst[x];
+					const u8 r = rlut[NATIVE_ENDIAN_VALUE_LE_BE(3, 0) ^ (rgb >> 16 & 0xff)];
+					const u8 g = glut[NATIVE_ENDIAN_VALUE_LE_BE(3, 0) ^ (rgb >> 8 & 0xff)];
+					const u8 b = blut[NATIVE_ENDIAN_VALUE_LE_BE(3, 0) ^ (rgb & 0xff)];
+					dst[x] = (r << 16) | (g << 8) | b;
+				}
+				else
+					dst[x] &= 0xffffff;
+			}
+		}
+	}
+}
+
+void namcos22s_state::run_screen_pass(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect, int mode)
+{
+	const int rows = cliprect.height();
+	const int count = std::clamp(rows / 16, 1, 64);
+	m_pass_bands.resize(count);
+	for (int i = 0; i < count; i++)
+	{
+		screen_pass_band &band = m_pass_bands[i];
+		band.state = this;
+		band.bitmap = &bitmap;
+		band.pri = &primap;
+		band.min_x = cliprect.min_x;
+		band.max_x = cliprect.max_x;
+		band.min_y = cliprect.min_y + rows * i / count;
+		band.max_y = cliprect.min_y + rows * (i + 1) / count - 1;
+		band.mode = mode;
+	}
+	osd_work_item_queue_multiple(m_pass_queue, screen_pass_work, count, &m_pass_bands[0], sizeof(screen_pass_band), WORK_ITEM_FLAG_AUTO_RELEASE);
+
+	// a worker that runs out of items wakes the waiter even while others are still busy (only
+	// high-frequency queues spin until done), so wait until every band has finished
+	while (!osd_work_queue_wait(m_pass_queue, osd_ticks_per_second() * 10)) { }
+}
+
+u32 namcos22s_state::screen_update_enhanced(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+{
+	render_frame_active();
+	update_mixer();
+	update_palette();
+	recalc_czram();
+
+	// background color
+	rgbaint_t bg_color(0, nthbyte(m_mixer, 0x08), nthbyte(m_mixer, 0x09), nthbyte(m_mixer, 0x0a));
+	if (BIT(m_mixer_flags, 0) && m_screen_fade_factor)
+	{
+		rgbaint_t fade_color(0, m_screen_fade_r, m_screen_fade_g, m_screen_fade_b);
+		bg_color.blend(fade_color, 0xff - m_screen_fade_factor);
+	}
+	m_pass_bgcolor = bg_color.to_rgba();
+
+	// text layer at 640x480 (NO_PEN where transparent), mixed in by the screen passes
+	const u8 layer = nthbyte(m_mixer, 0x1f);
+	m_pass_text = BIT(layer, 2);
+	std::fill(std::begin(m_text_side_row_pen), std::end(m_text_side_row_pen), NO_PEN);
+	if (m_pass_text)
+	{
+		apply_text_scroll();
+		m_text_tilemap->set_palette_offset(m_text_palbase);
+		m_mix_bitmap->fill(NO_PEN);
+		m_text_tilemap->draw(screen, *m_mix_bitmap, m_mix_bitmap->cliprect(), 0, 0, 0xff); // no priority writes
+		if (m_render_wide)
+			extend_text_rows();
+		prepare_text_mix();
+	}
+
+	run_screen_pass(bitmap, screen.priority(), cliprect, PASS_BACKGROUND);
+	if (BIT(layer, 1)) draw_sprites();
+	if (BIT(layer, 0)) draw_polygons();
+	m_poly->render_scene(screen, bitmap);
+	run_screen_pass(bitmap, screen.priority(), cliprect, PASS_FINAL);
+
+	return 0;
+}
+
 u32 namcos22s_state::screen_update_namcos22s(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
+	if (render_enhanced())
+		return screen_update_enhanced(screen, bitmap, cliprect);
+
 	render_frame_active();
 	update_mixer();
 	update_palette();
@@ -2719,6 +3114,8 @@ void namcos22s_state::init_tables()
 
 	save_item(NAME(m_czattr));
 	save_item(NAME(m_cz_was_written));
+
+	m_text_side_pen.fill(NO_PEN);
 }
 
 void namcos22_state::video_start()
@@ -2736,4 +3133,19 @@ void namcos22_state::video_start()
 	m_gfxdecode->gfx(0)->set_source((u8 *)m_cgram.target());
 
 	m_poly = std::make_unique<namcos22_renderer>(*this);
+
+	for (int i = 0; i <= WORK_MAX_THREADS; i++) // poly band renderers, one per thread
+		m_poly_threads.push_back(std::make_unique<namcos22_renderer>(*this));
+	m_pass_queue = osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI); // no WORK_QUEUE_FLAG_HIGH_FREQ: those queues are limited to 4 processors
+
+	// enhanced drawing (see m_render_scale)
+	m_render_xmap.resize(640);
+	for (int x = 0; x < 640; x++)
+		m_render_xmap[x] = x;
+}
+
+namcos22_state::~namcos22_state()
+{
+	if (m_pass_queue)
+		osd_work_queue_free(m_pass_queue);
 }

@@ -148,7 +148,12 @@ struct namcos22_object_data
 };
 
 
-class namcos22_renderer : public poly_manager<poly3d_t, namcos22_object_data, 4>
+// The scene is first prepared in drawing order (projected quads and sprites with their object
+// data), then drawn in horizontal screen bands in parallel, each band by its own renderer on
+// the calling thread: MAME's queued drawing sets up every row on one thread, which is too slow
+// at the higher render scales. The bands draw the same polys in the same order, so the pixels
+// are the same.
+class namcos22_renderer : public poly_manager<poly3d_t, namcos22_object_data, 4, POLY_FLAG_NO_WORK_QUEUE>
 {
 public:
 	namcos22_renderer(namcos22_state &state);
@@ -158,8 +163,23 @@ public:
 
 	void init();
 
+	using scanline_func = void (namcos22_renderer::*)(int32_t scanline, const extent_t &extent, const namcos22_object_data &extra, int threadid);
+	struct prepared_t
+	{
+		namcos22_object_data extra;
+		scanline_func func;
+		bool sprite; // 2 parameters instead of 4
+		rectangle clip;
+		int count;
+		vertex_t v[6];
+		s32 miny, maxy; // screen rows it may cover
+	};
+	void render_band(const std::vector<prepared_t> &items, s32 min_y, s32 max_y);
+
 private:
 	namcos22_state &m_state;
+	std::vector<prepared_t> m_prepared;
+	void add_prepared(const namcos22_object_data &extra, scanline_func func, bool sprite, int count, const vertex_t *v);
 
 	struct namcos22_scenenode m_scenenode_root;
 	struct namcos22_scenenode *m_scenenode_cur;
@@ -176,8 +196,6 @@ private:
 
 	void free_scenenode(struct namcos22_scenenode *node);
 	struct namcos22_scenenode *alloc_scenenode(running_machine &machine, struct namcos22_scenenode *node);
-
-	using scanline_func = void (namcos22_renderer::*)(int32_t scanline, const extent_t &extent, const namcos22_object_data &extra, int threadid);
 
 	void dispatch_scanline_poly(scanline_func callback, int clipverts, vertex_t const *clipv);
 	void renderscanline_poly(int32_t scanline, const extent_t &extent, const namcos22_object_data &extra, int threadid);
@@ -231,8 +249,11 @@ public:
 		m_opt(*this, "OPT.%u", 0),
 		m_mcu_out(*this, "mcuout%u", 0U),
 		m_cpuled_out(*this, "cpuled%u", 0U),
-		m_wheel_motor(*this, "wheel_motor")
+		m_wheel_motor(*this, "wheel_motor"),
+		m_render_cfg(*this, "RENDER")
 	{ }
+
+	virtual ~namcos22_state();
 
 	void cybrcomm(machine_config &config);
 	void namcos22(machine_config &config);
@@ -271,6 +292,18 @@ public:
 	int m_fog_g_per_cztype[4];
 	int m_fog_b_per_cztype[4];
 	u16 m_czattr[8] = { };
+
+	// Enhancements, not hardware, for games with a "RENDER" port (timecris): polygons and sprites
+	// drawn at m_render_scale times 640x480 (the game still sees its 480 lines), widescreen
+	// (WIDE_EXTRA more 640x480 pixels on each side, 854x480) and the gamma ramp switched off.
+	// Applied on reset; with the defaults the original drawing code runs.
+	static constexpr int WIDE_EXTRA = 107;
+	int m_render_scale = 1;
+	bool m_render_gamma = true;
+	bool m_render_wide = false;
+	s32 m_render_wide_ofs = 0; // WIDE_EXTRA at the render scale, 0 when 4:3
+	bool m_render_force = false; // enhanced drawing even with the defaults (MAME_S22_ENHANCED, for comparisons)
+	bool render_enhanced() const { return m_render_scale != 1 || m_render_wide || !m_render_gamma || m_render_force; }
 
 	required_device<palette_device> m_palette;
 	optional_shared_ptr<u32> m_czram;
@@ -445,6 +478,30 @@ protected:
 	output_finder<16> m_mcu_out;
 	output_finder<8> m_cpuled_out;
 	output_finder<> m_wheel_motor;
+	optional_ioport m_render_cfg;
+
+	// enhanced drawing (see m_render_scale)
+	void apply_render_settings();
+	int native_vpos() const { return m_screen->vpos() / m_render_scale; }
+	attotime m_native_frame_period;
+	std::vector<u16> m_render_xmap; // screen x -> 640x480 text column, NO_PEN at the widescreen sides
+	static constexpr u16 NO_PEN = 0xffff;
+	osd_work_queue *m_pass_queue = nullptr; // screen passes and poly bands
+
+public:
+	// poly bands (see namcos22_renderer): thin bands, drawn by the renderer of the worker thread
+	// that takes them, so the busy rows of a frame spread over all threads
+	struct render_band_job
+	{
+		namcos22_state *state;
+		const std::vector<namcos22_renderer::prepared_t> *items;
+		s32 min_y, max_y;
+	};
+	std::vector<std::unique_ptr<namcos22_renderer>> m_poly_threads; // one per work queue thread, + the waiting thread
+	std::vector<render_band_job> m_band_jobs;
+	void render_bands(const std::vector<namcos22_renderer::prepared_t> &items, const rectangle &visarea);
+	static void *render_band_work(void *param, int threadid);
+protected:
 
 	u8 m_syscontrol[0x20] = { };
 	bool m_dsp_irq_enabled = false;
@@ -553,6 +610,40 @@ protected:
 	void recalc_czram();
 	void namcos22s_mix_text_layer(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect, int prival);
 	u32 screen_update_namcos22s(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+
+	// enhanced drawing (see namcos22_state::m_render_scale): background + text, sprites and
+	// polygons at the render scale, then text over them + gamma; the screen passes run in bands
+	enum { PASS_BACKGROUND, PASS_FINAL };
+	struct screen_pass_band
+	{
+		namcos22s_state *state;
+		bitmap_rgb32 *bitmap;
+		bitmap_ind8 *pri;
+		s32 min_x, max_x, min_y, max_y;
+		int mode;
+	};
+	struct text_mix_t // the mixer settings namcos22s_mix_text_layer reads, for one frame
+	{
+		u8 alpha_check12, alpha_check13, alpha_mask, alpha_factor;
+		bool spot_enabled;
+		int spot_factor, spot_palbase;
+		bool fade_enabled;
+		int fade_factor;
+		rgbaint_t fade_color;
+	};
+	u32 screen_update_enhanced(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+	void prepare_text_mix();
+	bool mix_text_pixel(u16 src, u32 &dst, int prival) const;
+	void extend_text_rows();
+	void run_screen_pass(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect, int mode);
+	static void *screen_pass_work(void *param, int threadid);
+	void screen_pass(const screen_pass_band &band);
+	std::vector<screen_pass_band> m_pass_bands;
+	text_mix_t m_text_mix;
+	bool m_pass_text = false;
+	u32 m_pass_bgcolor = 0;
+	u16 m_text_side_row_pen[480]; // widescreen: pen of both sides per 640x480 row, NO_PEN for none
+	std::array<u16, 32> m_text_side_pen; // per tile row, the pen its sides were extended in (see extend_text_rows)
 
 	void namcos22s_czattr_w(offs_t offset, u16 data, u16 mem_mask = ~0);
 	u16 namcos22s_czattr_r(offs_t offset);
