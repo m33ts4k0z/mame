@@ -1245,6 +1245,7 @@ It can also be used with Final Furlong when wired correctly.
 #include "video/poly.h"
 #include "video/rgbutil.h"
 #include "emupal.h"
+#include "render.h"
 #include "screen.h"
 #include "speaker.h"
 #include "video.h"
@@ -1252,6 +1253,8 @@ It can also be used with Final Furlong when wired correctly.
 #include "md8412b_s23.h"
 #include "namco_settings.h"
 #include "vpx3220a.h"
+
+#include "namcos23.lh"
 
 #include "corefloat.h"
 #include "endianness.h"
@@ -1521,16 +1524,35 @@ struct namcos23_render_data
 	s32 fadecolor_g;
 	s32 fadecolor_b;
 	bool stencil_enabled;
+
+	// widescreen: first and last texel the corners cover; sampling stays inside them
+	bool tex_clamp;
+	float tex_u0, tex_u1, tex_v0, tex_v1;
+
+	// Depth test (setting): the polys are still drawn in sorted order, but a poly does not
+	// cover a pixel where an earlier solid one of the same priority layer is clearly nearer.
+	// MAME sorts on one depth per poly, and two polys whose depths come close (a wall and the
+	// structure behind it) can swap places from one frame to the next.
+	bool depth_test;
+	u8 depth_layer;
 };
 
 class namcos23_state;
+struct namcos23_poly_entry;
 
-class namcos23_renderer : public poly_manager<float, namcos23_render_data, 4>
+// Each renderer draws the polys of one horizontal screen band on the calling thread (no work
+// queue of its own); the bands run in parallel on the state's work queue.
+class namcos23_renderer : public poly_manager<float, namcos23_render_data, 4, POLY_FLAG_NO_WORK_QUEUE>
 {
 public:
 	namcos23_renderer(namcos23_state &state, const u16 *tmlrom, const u8 *tmhrom, const u8 *texrom, const u16 *texram,
 		const u32 tileid_mask, const u32 tile_mask);
+	struct share_tables_t { };
+	namcos23_renderer(share_tables_t, const namcos23_renderer &source); // another band, same decoded texture tables
 	void render_flush(screen_device &screen, bitmap_rgb32 &bitmap);
+	void render_band(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, s32 min_y, s32 max_y);
+	static s32 screen_row_offset(const namcos23_render_data &rd, int scale);
+	static void widen_screen_overlay(namcos23_poly_entry &p);
 	void render_sprite_scanline(s32 scanline, const extent_t& extent, const namcos23_render_data& object, int threadid);
 
 	template <bool Stencil, bool Shade, bool PolyFade, bool ColorFade, bool Blend, bool PolyAlpha>
@@ -1539,10 +1561,26 @@ public:
 private:
 	bool stencil_lookup(u32 x, u32 y);
 	u32 texture_lookup(const pen_t *pens, int penshift, int penmask, u32 x, u32 y, u8 &pen);
+	// the four texels of the last 2x2 block, reused while a span stays on the same block
+	struct bilinear_cache
+	{
+		bool valid = false;
+		u32 u0, v0;
+		u32 rgb[4];
+		u8 pen[4];
+		bool cut;
+	};
+	u32 texture_bilinear(bilinear_cache &cache, const pen_t *pens, int penshift, int penmask, float fu, float fv, int tbase, bool stencil, u8 &pen);
 
 	namcos23_state& m_state;
-	std::unique_ptr<u32[]> m_tmrom_decoded;
-	std::unique_ptr<u8[]> m_texattr_decoded;
+	int m_scale = 1; // copy of the state's render scale for the current flush
+	bool m_bilinear = false;
+	s32 m_wide_ofs = 0; // widescreen: screen x of the 4:3 picture's left edge (0 = 4:3 screen)
+	float *m_depth = nullptr; // depth test: eye depth and priority layer of the solid poly in each pixel
+	u8 *m_depth_layer = nullptr;
+	s32 m_depth_pitch = 0;
+	std::shared_ptr<u32[]> m_tmrom_decoded;
+	std::shared_ptr<u8[]> m_texattr_decoded;
 	const u8 *m_texrom;
 	const u16 *m_texram;
 	u32 m_tileid_mask;
@@ -1657,7 +1695,9 @@ struct c435_t
 
 struct render_t
 {
-	std::unique_ptr<namcos23_renderer> polymgr;
+	std::unique_ptr<namcos23_renderer> polymgr; // also the renderer of band 0
+	std::vector<std::unique_ptr<namcos23_renderer>> bands; // the other bands
+	std::vector<float> poly_miny, poly_maxy; // screen rows of each sorted poly, at the render scale
 	int cur;
 	int poly_count;
 	int count[2];
@@ -1684,6 +1724,8 @@ public:
 		m_czattr(*this, "czattr", 0x10, ENDIANNESS_BIG),
 		m_lightx(*this, "LIGHTX"),
 		m_lighty(*this, "LIGHTY"),
+		m_render_cfg(*this, "RENDER"),
+		m_gun_x(*this, "JVS_SCREEN_POSITION_INPUT_X1"),
 		m_devpad(*this, "devpad%u", 0U),
 		m_screen(*this, "screen"),
 		m_palette(*this, "palette"),
@@ -1727,6 +1769,14 @@ public:
 		m_lamps(*this, "lamp%u", 0U)
 	{ }
 
+	~namcos23_state()
+	{
+		if (m_frame_queue) // waits for a frame still drawn in the background, which uses m_pass_queue
+			osd_work_queue_free(m_frame_queue);
+		if (m_pass_queue)
+			osd_work_queue_free(m_pass_queue);
+	}
+
 	void s23(machine_config &config) ATTR_COLD;
 	void timecrs2(machine_config &config) ATTR_COLD;
 	void downhill(machine_config &config) ATTR_COLD;
@@ -1734,6 +1784,44 @@ public:
 
 	render_t m_render;
 	const u8 *m_sprrom;
+
+	// Enhancement, not hardware: polygons and sprites are drawn at m_render_scale times
+	// 640x480 (the game still sees 480 lines), optionally with bilinear texture filtering.
+	int m_render_scale = 1;
+	bool m_render_bilinear = false;
+	bool m_render_gamma = true; // apply the C404 gamma ramp uploaded by the game
+	// Widescreen: the screen is WIDE_EXTRA 640x480 pixels wider on each side (854x480, 16:9).
+	// Full-width 3D viewports fill it, edge-to-edge text rows (cinema bars, fades) are extended
+	// (see extend_text_rows), and the HUD and sprites stay 4:3 in the middle.
+	static constexpr int WIDE_EXTRA = 107;
+	bool m_render_wide = false;
+	s32 m_render_wide_ofs = 0; // WIDE_EXTRA at the render scale, 0 when 4:3
+	bool m_render_depth = false; // depth test on top of the poly sort (see namcos23_render_data::depth_test)
+	bool m_render_tri_fix = false; // back-face cull triangles on their own corners (see render_model)
+
+	// Black Level: channel levels up to m_render_black become 0 and the rest stretch back to 0-255.
+	// The night scenes have large areas at levels 1-2 (a dark teal haze over the horizon, 0/1/1),
+	// which show on screens with lifted blacks; TeknoParrot's picture is about 2 levels darker
+	// throughout (the attract's rocket platform: tower 32.7 vs 34.8, haze 0 vs 0/1/1).
+	static constexpr u8 BLACK_LEVEL = 2;
+	u8 m_render_black = 0;
+	std::array<u8, 256> m_black_lut;
+
+	// polys are drawn in horizontal screen bands in parallel, one renderer per band
+	struct render_band_job
+	{
+		namcos23_renderer *renderer;
+		bitmap_rgb32 *bitmap;
+		bitmap_ind8 *primap;
+		s32 min_y, max_y;
+	};
+	void render_bands(bitmap_rgb32 &bitmap, bitmap_ind8 &primap);
+	static void *render_band_work(void *param, int threadid);
+	std::vector<render_band_job> m_band_jobs;
+	std::vector<float> m_depth_buf; // depth test buffers, one entry per bitmap pixel
+	std::vector<u8> m_depth_layer_buf;
+	bool m_render_pipelined = false; // setting: draw one frame behind
+	bool m_render_deferred = false;  // render_flush only prepares; the background job draws
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -1748,6 +1836,7 @@ protected:
 	void c404_map(address_map &map, const u32 addr);
 
 	virtual void configure_jvs(device_jvs_interface &io);
+	u16 gun_x_r();
 
 	void irq_update_common(u32 cause);
 	virtual void irq_update(u32 cause);
@@ -1914,7 +2003,44 @@ protected:
 	void update_text_rowscroll();
 	void apply_text_scroll();
 	void draw_text_layer(screen_device &screen);
-	void mix_text_layer(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect, int prival);
+	void extend_text_rows();
+	u32 mix_text_pixel(u16 pen, u32 dst) const;
+
+	// The full-screen layer passes run in bands on a work queue (they grow with the render scale).
+	enum { PASS_BACKGROUND, PASS_FINAL, PASS_PRESENT };
+	struct screen_pass_band
+	{
+		namcos23_state *state;
+		bitmap_rgb32 *bitmap;
+		bitmap_ind8 *pri;
+		int min_x, max_x, min_y, max_y;
+		int mode; // background + text under polys, text over polys + gamma, or copy of the back buffer
+	};
+	static void *screen_pass_work(void *param, int threadid);
+	void screen_pass(const screen_pass_band &band);
+	void run_screen_pass(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect, int mode);
+	osd_work_queue *m_pass_queue = nullptr; // used by one thread at a time (MAME's thread, or the frame thread)
+	std::vector<screen_pass_band> m_pass_bands;
+	bool m_text_enabled = false;
+	u32 m_frame_bgcolor = 0;
+	const c404_t *m_pass_c404 = nullptr; // C404 state and palette the passes use: the live ones,
+	const pen_t *m_pass_pens = nullptr;  // or the copies of a frame drawn in the background
+
+	// "One frame behind": a frame is drawn in the background while the next one is emulated
+	// and shown at the next frame boundary.
+	osd_work_queue *m_frame_queue = nullptr;
+	bool m_frame_pending = false; // a frame is being drawn in the background
+	bool m_back_valid = false;    // m_back_bitmap holds a finished frame
+	bitmap_rgb32 m_back_bitmap;
+	bitmap_ind8 m_back_pri;
+	c404_t m_back_c404;
+	std::unique_ptr<pen_t[]> m_back_pens;
+	static void *frame_work(void *param, int threadid);
+	void draw_frame(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect);
+	void finish_background_frame();
+
+	void apply_render_settings();
+	int native_vpos() const { return m_screen->vpos() / m_render_scale; }
 
 	required_device<mips3_device> m_maincpu;
 	required_device<h83002_device> m_subcpu;
@@ -1929,6 +2055,8 @@ protected:
 	memory_share_creator<u32> m_czattr;
 	optional_ioport m_lightx;
 	optional_ioport m_lighty;
+	optional_ioport m_render_cfg;
+	optional_ioport m_gun_x;
 	required_device_array<snes_control_port_device, 2> m_devpad;
 	required_device<screen_device> m_screen;
 	required_device<palette_device> m_palette;
@@ -1942,6 +2070,13 @@ protected:
 	c422_t m_c422;
 	c435_t m_c435;
 	std::unique_ptr<bitmap_ind16> m_mix_bitmap;
+	std::unique_ptr<bitmap_ind8> m_text_pri; // text layer priority, expanded to the screen
+	// the text layer buffers have TEXT_PAD columns either side of the 640 (widescreen, see extend_text_rows)
+	static constexpr int TEXT_PAD = 112;
+	static constexpr u16 NO_PEN = 0xffff;
+	std::array<u16, 32> m_text_side_pen; // per tile row, the colour its sides were extended in (see extend_text_rows)
+	std::vector<u16> m_render_xmap; // screen x -> 640x480 x
+	attotime m_native_frame_period;
 
 	const u16 *m_tmlrom;
 	const u8 *m_tmhrom;
@@ -2307,7 +2442,7 @@ u8 namcos23_state::nthbyte(const u32 *pSource, int offs)
 
 namcos23_renderer::namcos23_renderer(namcos23_state &state, const u16 *tmlrom, const u8 *tmhrom, const u8 *texrom, const u16 *texram,
 		const u32 tileid_mask, const u32 tile_mask)
-	: poly_manager<float, namcos23_render_data, 4>(state.machine()),
+	: poly_manager<float, namcos23_render_data, 4, POLY_FLAG_NO_WORK_QUEUE>(state.machine()),
 	m_state(state),
 	m_tmrom_decoded(nullptr),
 	m_texattr_decoded(nullptr),
@@ -2316,8 +2451,8 @@ namcos23_renderer::namcos23_renderer(namcos23_state &state, const u16 *tmlrom, c
 	m_tileid_mask(tileid_mask),
 	m_tile_mask(tile_mask)
 {
-	m_tmrom_decoded = std::make_unique<u32[]>((m_tileid_mask | 0xff) + 1);
-	m_texattr_decoded = std::make_unique<u8[]>((m_tileid_mask | 0xff) + 1);
+	m_tmrom_decoded = std::make_shared<u32[]>((m_tileid_mask | 0xff) + 1);
+	m_texattr_decoded = std::make_shared<u8[]>((m_tileid_mask | 0xff) + 1);
 	for (u32 tileid = 0; tileid <= m_tileid_mask; tileid++)
 	{
 		u8 attr = tmhrom[tileid >> 1];
@@ -2328,6 +2463,18 @@ namcos23_renderer::namcos23_renderer(namcos23_state &state, const u16 *tmlrom, c
 		m_tmrom_decoded[tileid] = ((tmlrom[tileid] | ((attr & 1) << 16)) & m_tile_mask) << 8;
 		m_texattr_decoded[tileid] = attr >> 1;
 	}
+}
+
+namcos23_renderer::namcos23_renderer(share_tables_t, const namcos23_renderer &source)
+	: poly_manager<float, namcos23_render_data, 4, POLY_FLAG_NO_WORK_QUEUE>(source.m_state.machine()),
+	m_state(source.m_state),
+	m_tmrom_decoded(source.m_tmrom_decoded),
+	m_texattr_decoded(source.m_texattr_decoded),
+	m_texrom(source.m_texrom),
+	m_texram(source.m_texram),
+	m_tileid_mask(source.m_tileid_mask),
+	m_tile_mask(source.m_tile_mask)
+{
 }
 
 // 3D hardware
@@ -3499,6 +3646,95 @@ u32 namcos23_renderer::texture_lookup(const pen_t *pens, int penshift, int penma
 	return pens[(pen >> penshift) & penmask];
 }
 
+// Enhancement, not hardware: blends the four texels around (fu, fv). Stencilled (cut-out)
+// texels are left out so cut-out edges get no halo; pen is the nearest texel's pen.
+inline u32 namcos23_renderer::texture_bilinear(bilinear_cache &cache, const pen_t *pens, int penshift, int penmask, float fu, float fv, int tbase, bool stencil, u8 &pen)
+{
+	// texel to the top left of the sample point (texel centers are at +0.5) and the 8-bit fractions
+	const float su = fu - 0.5f;
+	const float sv = fv - 0.5f;
+	s32 iu = s32(su);
+	s32 iv = s32(sv);
+	if (su < float(iu))
+		iu--;
+	if (sv < float(iv))
+		iv--;
+	const u32 fx = std::min(u32((su - float(iu)) * 256.0f), 255U);
+	const u32 fy = std::min(u32((sv - float(iv)) * 256.0f), 255U);
+	const u32 u0 = u32(iu);
+	const u32 v0 = u32(iv);
+
+	// fetch the four texels: 0 = (u0, v0), 1 = (u0 + 1, v0), 2 = (u0, v0 + 1), 3 = (u0 + 1, v0 + 1)
+	// (pens, tbase and stencil are the same for the whole span, so the block position is the key)
+	u32 *const rgb = cache.rgb;
+	u8 *const texpen = cache.pen;
+	if (!cache.valid || u0 != cache.u0 || v0 != cache.v0)
+	{
+		cache.valid = true;
+		cache.u0 = u0;
+		cache.v0 = v0;
+		const u32 vt = v0 + tbase;
+		if ((u0 & 15) != 15 && (vt & 15) != 15)
+		{
+			// all four in the same 16x16 tile (the usual case): decode the tile once, as texture_lookup does
+			const u32 tileid = ((u0 >> 4) & 0xff) | ((vt << 4) & m_tileid_mask);
+			const u32 tile = m_tmrom_decoded[tileid];
+			const u32 attr = m_texattr_decoded[tileid];
+			for (int i = 0; i < 4; i++)
+			{
+				u32 tu = u0 + (i & 1);
+				u32 tv = vt + (i >> 1);
+				if (BIT(attr, 0))
+					tv = ~tv;
+				if (BIT(attr, 1))
+					tu = ~tu;
+				if (BIT(attr, 2))
+					std::swap(tu, tv);
+				texpen[i] = m_texrom[tile | ((tv << 4) & 0xf0) | (tu & 0x0f)];
+				rgb[i] = pens[(texpen[i] >> penshift) & penmask];
+			}
+		}
+		else
+		{
+			for (int i = 0; i < 4; i++)
+				rgb[i] = texture_lookup(pens, penshift, penmask, u0 + (i & 1), vt + (i >> 1), texpen[i]);
+		}
+
+		cache.cut = false;
+		if (stencil)
+			for (int i = 0; i < 4 && !cache.cut; i++)
+				cache.cut = stencil_lookup(u0 + (i & 1), v0 + (i >> 1));
+	}
+
+	// pen of the nearest texel (alpha pen checks)
+	pen = texpen[(fx >= 128 ? 1 : 0) + (fy >= 128 ? 2 : 0)];
+
+	if (!cache.cut)
+		return 0xff000000 | rgbaint_t::bilinear_filter(rgb[0], rgb[1], rgb[2], rgb[3], fx, fy);
+
+	// next to a cut-out: blend only the texels that are drawn, so the edge gets no halo
+	const u32 weight[4] = { (256 - fx) * (256 - fy), fx * (256 - fy), (256 - fx) * fy, fx * fy };
+	u32 r = 0, g = 0, b = 0, total = 0, best = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		if (!weight[i] || stencil_lookup(u0 + (i & 1), v0 + (i >> 1)))
+			continue;
+		r += ((rgb[i] >> 16) & 0xff) * weight[i];
+		g += ((rgb[i] >> 8) & 0xff) * weight[i];
+		b += (rgb[i] & 0xff) * weight[i];
+		total += weight[i];
+		if (weight[i] > best)
+		{
+			best = weight[i];
+			pen = texpen[i];
+		}
+	}
+
+	if (!total)
+		return texture_lookup(pens, penshift, penmask, u32(fu), u32(fv) + tbase, pen);
+	return 0xff000000 | ((r / total) << 16) | ((g / total) << 8) | (b / total);
+}
+
 void namcos23_renderer::render_sprite_scanline(s32 scanline, const extent_t& extent, const namcos23_render_data& object, int threadid)
 {
 	const namcos23_render_data& rd = object;
@@ -3583,17 +3819,39 @@ void namcos23_renderer::render_scanline(s32 scanline, const extent_t& extent, co
 	const s32 polycolor_r = rd.polycolor_r;
 	const s32 polycolor_g = rd.polycolor_g;
 	const s32 polycolor_b = rd.polycolor_b;
-	const s32 clip_left = ((320 - rd.vp_size_x) + rd.vp_offset_x);
-	const s32 clip_right = ((320 + rd.vp_size_x) + rd.vp_offset_x);
-	const s32 clip_top = ((240 - rd.vp_size_y) - rd.vp_offset_y);
-	const s32 clip_bottom = ((240 + rd.vp_size_y) - rd.vp_offset_y);
+	const s32 scale = m_scale;
+	const s32 clip_left = ((320 - rd.vp_size_x) + rd.vp_offset_x) * scale;
+	const s32 clip_right = ((320 + rd.vp_size_x) + rd.vp_offset_x) * scale;
+	const s32 clip_top = ((240 - rd.vp_size_y) - rd.vp_offset_y) * scale;
+	const s32 clip_bottom = ((240 + rd.vp_size_y) - rd.vp_offset_y) * scale;
+
+	// widescreen: the 4:3 picture moves right by m_wide_ofs and full-width viewports widen to the whole screen
+	const s32 ofs = m_wide_ofs;
+	s32 draw_left = clip_left;
+	s32 draw_right = clip_right;
+	if (ofs)
+	{
+		if (clip_left <= 0 && clip_right >= 640 * scale)
+		{
+			draw_left = -ofs;
+			draw_right = 640 * scale + ofs;
+		}
+		draw_left += ofs;
+		draw_right += ofs;
+	}
 
 	const s32 offset_scanline = scanline + (s32)clip_top;
-	if (offset_scanline < 0 || offset_scanline >= 480 || offset_scanline < clip_top || offset_scanline >= clip_bottom)
+	if (offset_scanline < 0 || offset_scanline >= 480 * scale || offset_scanline < clip_top || offset_scanline >= clip_bottom)
 		return;
 
 	u32 *dest = &rd.bitmap->pix(offset_scanline);
 	u8 *primap = &rd.primap->pix(offset_scanline);
+
+	// depth test: skip pixels where a solid poly of the same layer drawn earlier is clearly
+	// nearer (by more than 1/64, so coplanar decals and touching parts still draw in sort order)
+	float *const depth = (rd.depth_test && m_depth) ? &m_depth[offset_scanline * m_depth_pitch] : nullptr;
+	u8 *const depth_layer = depth ? &m_depth_layer[offset_scanline * m_depth_pitch] : nullptr;
+	constexpr float DEPTH_SLACK = 1.0f + 1.0f / 64;
 
 	const pen_t *pens = rd.pens;
 	int prioverchar = rd.prioverchar;
@@ -3613,17 +3871,42 @@ void namcos23_renderer::render_scanline(s32 scanline, const extent_t& extent, co
 		penshift = 4 * (~rd.cmode & 1);
 	}
 
+	bilinear_cache bcache;
 	for (int x = extent.startx; x < extent.stopx; x++)
 	{
 		float ooz = 1.0f / z;
-		u32 tx = u32(u * ooz);
-		u32 ty = u32(v * ooz);
-		u8 pen = 0;
-		const u32 view_x = x + clip_left;
-		if ((!Stencil || !stencil_lookup(tx, ty)) && view_x >= clip_left && view_x < clip_right)
+		float fu = u * ooz;
+		float fv = v * ooz;
+		if (rd.tex_clamp)
 		{
-			ty += rd.tbase;
-			u32 tex_rgb = texture_lookup(pens, penshift, penmask, tx, ty, pen);
+			fu = std::clamp(fu, rd.tex_u0, rd.tex_u1 + 0.99f);
+			fv = std::clamp(fv, rd.tex_v0, rd.tex_v1 + 0.99f);
+		}
+		u32 tx = u32(fu);
+		u32 ty = u32(fv);
+		u8 pen = 0;
+		const u32 view_x = x + clip_left + ofs;
+		if ((!Stencil || !stencil_lookup(tx, ty)) && view_x >= draw_left && view_x < draw_right &&
+			(!depth || depth_layer[view_x] != rd.depth_layer || ooz <= depth[view_x] * DEPTH_SLACK))
+		{
+			u32 tex_rgb;
+			if (m_bilinear)
+			{
+				float bu = u * ooz;
+				float bv = v * ooz;
+				if (rd.tex_clamp)
+				{
+					// blend only texels inside the range
+					bu = std::clamp(bu, rd.tex_u0 + 0.5f, rd.tex_u1 + 0.5f);
+					bv = std::clamp(bv, rd.tex_v0 + 0.5f, rd.tex_v1 + 0.5f);
+				}
+				tex_rgb = texture_bilinear(bcache, pens, penshift, penmask, bu, bv, rd.tbase, Stencil, pen);
+			}
+			else
+			{
+				ty += rd.tbase;
+				tex_rgb = texture_lookup(pens, penshift, penmask, tx, ty, pen);
+			}
 			s32 r = s32((tex_rgb >> 16) & 0xff);
 			s32 g = s32((tex_rgb >> 8) & 0xff);
 			s32 b = s32(tex_rgb & 0xff);
@@ -3676,6 +3959,11 @@ void namcos23_renderer::render_scanline(s32 scanline, const extent_t& extent, co
 
 			dest[view_x] = 0xff000000 | (r << 16) | (g << 8) | b;
 			primap[view_x] = (primap[view_x] & ~1) | prioverchar;
+			if (depth && !(Blend || (PolyAlpha && (alpha_enabled || pen == alpha_pen))))
+			{
+				depth[view_x] = ooz;
+				depth_layer[view_x] = rd.depth_layer;
+			}
 		}
 
 		z += dz;
@@ -4203,7 +4491,10 @@ void namcos23_state::render_model(const namcos23_render_entry *re)
 					(pv[0].y * (pv[2].x * z3 - z2 * pv[3].x))+
 					(z0 * (pv[2].y * pv[3].x - pv[2].x * pv[3].y));
 
-				if (c1 >= 0.f && c2 >= 0.f)
+				// a triangle has no 4th corner: pv[3] is left over from an earlier poly, so its back
+				// face flickers in and out (tc2 attract, the satellites); Triangle Fix judges it on c1
+				const bool tri_fix = m_render_tri_fix && ne == 3;
+				if (c1 >= 0.f && (c2 >= 0.f || tri_fix))
 				{
 					if (type & 0x00010000)
 						break;
@@ -4367,13 +4658,13 @@ static int render_poly_compare(const void *i1, const void *i2)
 
 #define RENDER_SCANLINE_ENTRY(stencil, shade, polyfade, colorfade, blend, polyalpha) \
 	if (p->vertex_count == 3) \
-		render_triangle<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), p->pv[0], p->pv[1], p->pv[2]); \
+		render_triangle<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), pv[0], pv[1], pv[2]); \
 	else if (p->vertex_count == 4) \
-		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 4, p->pv); \
+		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 4, pv); \
 	else if (p->vertex_count == 5) \
-		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 5, p->pv); \
+		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 5, pv); \
 	else if (p->vertex_count == 6) \
-		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 6, p->pv); \
+		render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_scanline<stencil, shade, polyfade, colorfade, blend, polyalpha>, this), 6, pv); \
 	break;
 
 void namcos23_renderer::render_flush(screen_device &screen, bitmap_rgb32 &bitmap)
@@ -4388,21 +4679,171 @@ void namcos23_renderer::render_flush(screen_device &screen, bitmap_rgb32 &bitmap
 
 	qsort(render.poly_order, render.poly_count, sizeof(namcos23_poly_entry *), render_poly_compare);
 
-	const static rectangle scissor(0, 639, 0, 479);
-
+	// screen row range of each poly at the render scale, so each band can skip the others
+	const int scale = m_state.m_render_scale;
+	render.poly_miny.resize(render.poly_count);
+	render.poly_maxy.resize(render.poly_count);
 	for (int i = 0; i < render.poly_count; i++)
 	{
 		const namcos23_poly_entry *p = render.poly_order[i];
-		namcos23_render_data& extra = render.polymgr->object_data().next();
+		const int count = p->rd.sprite ? 4 : std::clamp(p->vertex_count, 0, 16);
+		float miny = FLT_MAX, maxy = -FLT_MAX;
+		for (int v = 0; v < count; v++)
+		{
+			miny = std::min(miny, p->pv[v].y);
+			maxy = std::max(maxy, p->pv[v].y);
+		}
+		const s32 rowofs = screen_row_offset(p->rd, scale);
+		render.poly_miny[i] = miny * scale + rowofs;
+		render.poly_maxy[i] = maxy * scale + rowofs;
+
+		// Widescreen: the sky is made of panels that meet at the 4:3 edges, and the half-texel
+		// offset makes a panel's last column sample one texel past its texture (hidden at the
+		// screen edge in 4:3, a line in the middle of the screen here), so keep sampling
+		// within the texels the corners cover.
+		namcos23_render_data &rd = render.poly_order[i]->rd;
+		if (m_state.m_render_wide && !rd.sprite && !rd.direct)
+			widen_screen_overlay(*render.poly_order[i]);
+		// (not for polys the game sorts on their nearest or farthest point, h bits 8-9 = 0 or 1:
+		// it uses those to keep effects like the clouds behind, or things in front)
+		rd.depth_test = m_state.m_render_depth && !rd.sprite && !rd.direct && (rd.h & 0x200);
+		rd.depth_layer = p->zkey >> 21;
+		rd.tex_clamp = false;
+		if (m_state.m_render_wide && !rd.sprite)
+		{
+			float umin = FLT_MAX, umax = -FLT_MAX, vmin = FLT_MAX, vmax = -FLT_MAX;
+			for (int v = 0; v < count; v++)
+			{
+				const float w = p->pv[v].p[0];
+				if (w == 0.0f)
+					continue;
+				umin = std::min(umin, p->pv[v].p[1] / w);
+				umax = std::max(umax, p->pv[v].p[1] / w);
+				vmin = std::min(vmin, p->pv[v].p[2] / w);
+				vmax = std::max(vmax, p->pv[v].p[2] / w);
+			}
+			if (umin <= umax)
+			{
+				// (u * w / w comes back a little off, so allow for rounding)
+				const float e = 1.0f / 64;
+				rd.tex_clamp = true;
+				rd.tex_u0 = floorf(umin + e);
+				rd.tex_u1 = std::max(rd.tex_u0, ceilf(umax - 0.5f - e) - 1.0f);
+				rd.tex_v0 = floorf(vmin + e);
+				rd.tex_v1 = std::max(rd.tex_v0, ceilf(vmax - 0.5f - e) - 1.0f);
+			}
+		}
+	}
+
+	if (!m_state.m_render_deferred)
+	{
+		m_state.render_bands(bitmap, screen.priority());
+		render.poly_count = 0;
+	}
+}
+
+// Widescreen: the game frames its character introductions with black bars that are flat 3D
+// rectangles just wider than the 4:3 screen (x -24.9 to 664.9 in timecrs2). A rectangle like
+// that, facing the screen with both side edges just outside the 4:3 picture, is stretched to
+// the widescreen edges; real scenery is never that exact.
+void namcos23_renderer::widen_screen_overlay(namcos23_poly_entry &p)
+{
+	const namcos23_render_data &rd = p.rd;
+	if (p.vertex_count != 4 || rd.vp_size_x != 320 || rd.vp_offset_x != 0)
+		return;
+	for (int v = 0; v < 4; v++)
+	{
+		const poly_vertex &a = p.pv[v];
+		const poly_vertex &b = p.pv[(v + 1) & 3];
+		// constant depth, sides outside the 4:3 picture, edges horizontal or vertical
+		if (std::abs(a.p[0] - p.pv[0].p[0]) > p.pv[0].p[0] * 1e-4f || (a.x > -64.0f && a.x < 0.0f) == (a.x > 640.0f && a.x < 704.0f) ||
+			(a.x != b.x && a.y != b.y))
+			return;
+	}
+	const float extra = namcos23_state::WIDE_EXTRA;
+	for (int v = 0; v < 4; v++)
+		p.pv[v].x += (p.pv[v].x < 0.0f) ? -extra : extra;
+}
+
+// 3D polys are rasterized in viewport rows (render_scanline adds the viewport top);
+// sprites already use screen rows
+s32 namcos23_renderer::screen_row_offset(const namcos23_render_data &rd, int scale)
+{
+	return rd.sprite ? 0 : ((240 - rd.vp_size_y) - rd.vp_offset_y) * scale;
+}
+
+void namcos23_renderer::render_band(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, s32 min_y, s32 max_y)
+{
+	render_t &render = m_state.m_render;
+
+	m_scale = m_state.m_render_scale;
+	m_bilinear = m_state.m_render_bilinear;
+	m_wide_ofs = m_state.m_render_wide_ofs;
+	const s32 width = 640 * m_scale + 2 * m_wide_ofs;
+	m_depth = nullptr;
+	m_depth_layer = nullptr;
+	if (m_state.m_render_depth)
+	{
+		// this band's rows start empty (layer 0xff matches no poly)
+		m_depth_pitch = bitmap.rowpixels();
+		m_depth = m_state.m_depth_buf.data();
+		m_depth_layer = m_state.m_depth_layer_buf.data();
+		const s32 first = std::max(min_y, 0), last = std::min(max_y, bitmap.height() - 1);
+		if (first <= last)
+			std::fill_n(&m_depth_layer[first * m_depth_pitch], (last - first + 1) * m_depth_pitch, 0xff);
+	}
+
+	for (int i = 0; i < render.poly_count; i++)
+	{
+		if (render.poly_maxy[i] < min_y - 1 || render.poly_miny[i] > max_y + 1)
+			continue;
+
+		const namcos23_poly_entry *p = render.poly_order[i];
+
+		// the band's screen rows in the rows this poly is rasterized in, within the usual 640x480 scissor
+		const s32 rowofs = screen_row_offset(p->rd, m_scale);
+		rectangle scissor(0, 640 * m_scale - 1, std::max(min_y - rowofs, 0), std::min(max_y - rowofs, 480 * m_scale - 1));
+		if (scissor.min_y > scissor.max_y)
+			continue;
+		if (m_wide_ofs)
+		{
+			if (p->rd.sprite)
+			{
+				// sprites stay in the 4:3 picture
+				scissor.min_x += m_wide_ofs;
+				scissor.max_x += m_wide_ofs;
+			}
+			else
+			{
+				// the whole screen in viewport columns (render_scanline keeps each viewport's own limits)
+				const s32 col0 = ((320 - p->rd.vp_size_x) + p->rd.vp_offset_x) * m_scale + m_wide_ofs;
+				scissor.min_x = -col0;
+				scissor.max_x = width - 1 - col0;
+			}
+		}
+
+		namcos23_render_data& extra = object_data().next();
 		extra = p->rd;
 		extra.bitmap = &bitmap;
-		extra.primap = &screen.priority();
+		extra.primap = &primap;
 		extra.prioverchar = 2;
+
+		// screen coordinates at the render scale (texture and shading parameters are unchanged)
+		poly_vertex pv[16];
+		const int count = std::clamp(p->vertex_count, 4, 16);
+		for (int v = 0; v < count; v++)
+		{
+			pv[v] = p->pv[v];
+			pv[v].x *= m_scale;
+			pv[v].y *= m_scale;
+			if (p->rd.sprite)
+				pv[v].x += m_wide_ofs;
+		}
 
 		// We should probably split the polygons into triangles ourselves to ensure everything is being rendered properly
 		if (p->rd.sprite)
 		{
-			render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_sprite_scanline, this), 4, p->pv);
+			render_triangle_fan<4>(scissor, render_delegate(&namcos23_renderer::render_sprite_scanline, this), 4, pv);
 		}
 		else
 		{
@@ -4482,7 +4923,40 @@ void namcos23_renderer::render_flush(screen_device &screen, bitmap_rgb32 &bitmap
 		}
 	}
 
-	render.poly_count = 0;
+	// no work queue: this draws the band's queued scanlines on this thread
+	wait();
+}
+
+void namcos23_state::render_bands(bitmap_rgb32 &bitmap, bitmap_ind8 &primap)
+{
+	// more bands than threads, so threads that finish early take over the remaining bands
+	const int count = m_render.bands.size() + 1;
+	const int rows = 480 * m_render_scale;
+	if (m_render_depth)
+	{
+		const size_t size = size_t(bitmap.rowpixels()) * bitmap.height();
+		m_depth_buf.resize(size);
+		m_depth_layer_buf.resize(size);
+	}
+	m_band_jobs.resize(count);
+	for (int i = 0; i < count; i++)
+	{
+		render_band_job &job = m_band_jobs[i];
+		job.renderer = i ? m_render.bands[i - 1].get() : m_render.polymgr.get();
+		job.bitmap = &bitmap;
+		job.primap = &primap;
+		job.min_y = rows * i / count;
+		job.max_y = rows * (i + 1) / count - 1;
+	}
+	osd_work_item_queue_multiple(m_pass_queue, render_band_work, count, &m_band_jobs[0], sizeof(render_band_job), WORK_ITEM_FLAG_AUTO_RELEASE);
+	while (!osd_work_queue_wait(m_pass_queue, osd_ticks_per_second() * 10)) { } // see run_screen_pass
+}
+
+void *namcos23_state::render_band_work(void *param, int threadid)
+{
+	render_band_job &job = *(render_band_job *)param;
+	job.renderer->render_band(*job.bitmap, *job.primap, job.min_y, job.max_y);
+	return nullptr;
 }
 
 void gorgon_state::render_run(screen_device &screen, bitmap_rgb32 &bitmap)
@@ -4843,9 +5317,19 @@ void namcos23_state::video_start()
 	m_tileid_mask = (memregion("textilemapl")->bytes()/2 - 1) & ~0xff; // Used for y masking
 	m_tile_mask = memregion("textile")->bytes()/256 - 1;
 
-	m_mix_bitmap = std::make_unique<bitmap_ind16>(640, 480);
+	m_mix_bitmap = std::make_unique<bitmap_ind16>(TEXT_PAD + 640 + TEXT_PAD, 480);
+	m_text_pri = std::make_unique<bitmap_ind8>(TEXT_PAD + 640 + TEXT_PAD, 480);
+	m_text_side_pen.fill(NO_PEN);
+	// no WORK_QUEUE_FLAG_HIGH_FREQ: those queues are limited to 4 processors
+	m_pass_queue = osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI);
+	m_frame_queue = osd_work_queue_alloc(0); // one thread that draws a frame behind
+	m_back_pens = std::make_unique<pen_t[]>(m_palette->entries());
+	m_render_xmap.resize(640);
+	for (int x = 0; x < 640; x++)
+		m_render_xmap[x] = TEXT_PAD + x;
 	m_render.polymgr = std::make_unique<namcos23_renderer>(*this, m_tmlrom, m_tmhrom, m_texrom, m_c412.sram, m_tileid_mask, m_tile_mask);
-
+	for (int i = 1; i < 64; i++) // 64 bands
+		m_render.bands.push_back(std::make_unique<namcos23_renderer>(namcos23_renderer::share_tables_t(), *m_render.polymgr));
 	m_ptrom_limit = memregion("pointrom")->bytes()/4;
 }
 
@@ -4872,13 +5356,14 @@ void namcos23_state::draw_text_layer(screen_device &screen)
 	// ----.xx--.----.---- flip
 	// ----.--xx.xxxx.xxxx code
 
+	m_text_pri->fill(0);
 	for (u32 tmy = 0; tmy < 30; tmy++)
 	{
 		for (u32 ty = 0; ty < 16; ty++)
 		{
 			const u32 y = (tmy << 4) | ty;
-			u16 *dst = &m_mix_bitmap->pix(y);
-			u8 *pri = &screen.priority().pix(y);
+			u16 *dst = &m_mix_bitmap->pix(y, TEXT_PAD);
+			u8 *pri = &m_text_pri->pix(y, TEXT_PAD);
 			const u32 scrolled_y = (y + m_c404.yscroll) & 0x03ff;
 			const u32 adjusted_tmy = scrolled_y >> 4;
 			const u32 adjusted_ty = scrolled_y & 0xf;
@@ -4919,64 +5404,236 @@ void namcos23_state::draw_text_layer(screen_device &screen)
 			}
 		}
 	}
+
+	if (m_render_wide)
+		extend_text_rows();
 }
 
-void namcos23_state::mix_text_layer(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect, int prival)
+// Widescreen: the game draws its cinema bars and fades with the text layer, but only the 40
+// visible columns of the tilemap (what it keeps beyond them is not meant to be seen: the
+// scrolling banner only a few letters ahead, leftovers of earlier screens). Each tile row the
+// text covers from edge to edge continues to the screen edges in one colour, taken from its
+// outermost 16 columns on both sides: a tile row of one colour there (bar, fade) uses it; one
+// with banner letters at the edges uses the nearest one-colour tile row of the same bar; failing
+// that, its most common colour (at least half), kept from frame to frame while it still covers
+// a quarter, so letters passing both edges cannot turn the row white. The banner letters stay
+// in the 4:3 middle.
+void namcos23_state::extend_text_rows()
 {
-	const pen_t *pens = m_palette->pens();
-	u8 pen = 0;
-
-	// prepare fader
-	const bool fade_enabled = (m_c404.fade_flags & 2) && m_c404.screen_fade_factor;
-	const s32 fadefactor = 0xff - m_c404.screen_fade_factor;
-	const s32 fadefactor_inv = 0x100 - fadefactor;
-	const s32 fadecolor_r = m_c404.screen_fade_r;
-	const s32 fadecolor_g = m_c404.screen_fade_g;
-	const s32 fadecolor_b = m_c404.screen_fade_b;
-	const s32 alphafactor = 0xff - m_c404.alpha_factor;
-	const s32 alphafactor_inv = 0x100 - alphafactor;
-
-	// mix textlayer with poly/sprites
-	for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
+	struct block_t
 	{
-		u16 const *const src = &m_mix_bitmap->pix(y);
-		u8 const *const pri = &screen.priority().pix(y);
-		u32 *dst = &bitmap.pix(y);
-		for (int x = cliprect.min_x; x <= cliprect.max_x; x++, dst++)
+		u32 y0, y1;
+		bool covered;
+		int n;
+		u16 pens[16];
+		u32 counts[16];
+		u32 share(u16 pen) const { const int i = std::find(pens, pens + n, pen) - pens; return (i < n) ? counts[i] : 0U; }
+	};
+	std::array<block_t, 32> blocks;
+
+	// blocks follow the tile rows, which the vertical scroll moves
+	const u32 first = (16 - (m_c404.yscroll & 15)) & 15;
+	int count = 0;
+	for (u32 y0 = 0; y0 < 480; count++)
+	{
+		block_t &b = blocks[count];
+		b.y0 = y0;
+		b.y1 = std::min((y0 < first) ? first : y0 + 16, 480U);
+		b.covered = true;
+		for (u32 y = b.y0; y < b.y1 && b.covered; y++)
+			b.covered = !std::memchr(&m_text_pri->pix(y, TEXT_PAD), 0, 640);
+
+		// pens of the edge columns (a block has only a few)
+		b.n = 0;
+		for (u32 y = b.y0; y < b.y1 && b.covered; y++)
 		{
-			// skip if transparent or under poly/sprite
-			if (pri[x] == prival)
+			const u16 *const row = &m_mix_bitmap->pix(y, TEXT_PAD);
+			for (int c = 0; c < 32; c++)
 			{
-				const u32 rgb = pens[src[x]];
-				s32 r = (s32)((rgb >> 16) & 0xff);
-				s32 g = (s32)((rgb >> 8) & 0xff);
-				s32 b = (s32)(rgb & 0xff);
-				pen = src[x];
-
-				// apply fade
-				if (fade_enabled)
+				const u16 pen = row[(c < 16) ? c : 640 - 32 + c];
+				int i = 0;
+				while (i < b.n && b.pens[i] != pen)
+					i++;
+				if (i == b.n)
 				{
-					r = ((r * fadefactor) + (fadecolor_r * fadefactor_inv)) >> 8;
-					g = ((g * fadefactor) + (fadecolor_g * fadefactor_inv)) >> 8;
-					b = ((b * fadefactor) + (fadecolor_b * fadefactor_inv)) >> 8;
+					if (b.n == 16)
+						continue;
+					b.pens[b.n] = pen;
+					b.counts[b.n++] = 0;
+				}
+				b.counts[i]++;
+			}
+		}
+		y0 = b.y1;
+	}
+
+	for (int k = 0; k < count; k++)
+	{
+		const block_t &b = blocks[k];
+		u16 &kept = m_text_side_pen[k];
+		if (!b.covered)
+		{
+			kept = NO_PEN;
+			continue;
+		}
+
+		// one colour at the edges, or the nearest such tile row of the same bar
+		const u32 total = (b.y1 - b.y0) * 32;
+		int solid = -1, below = -1;
+		for (int j = k; j >= 0 && blocks[j].covered && solid < 0; j--)
+			if (blocks[j].n == 1)
+				solid = j;
+		for (int j = k + 1; j < count && blocks[j].covered && below < 0; j++)
+			if (blocks[j].n == 1)
+				below = j;
+		if (below >= 0 && (solid < 0 || below - k < k - solid))
+			solid = below;
+		if (solid >= 0)
+			kept = blocks[solid].pens[0];
+		else if (b.share(kept) * 4 < total)
+		{
+			const int best = std::max_element(b.counts, b.counts + b.n) - b.counts;
+			kept = (b.counts[best] * 2 >= total) ? b.pens[best] : NO_PEN;
+		}
+		if (kept == NO_PEN)
+			continue;
+
+		for (u32 y = b.y0; y < b.y1; y++)
+		{
+			std::fill_n(&m_mix_bitmap->pix(y), TEXT_PAD, kept);
+			std::fill_n(&m_mix_bitmap->pix(y, TEXT_PAD + 640), TEXT_PAD, kept);
+			std::fill_n(&m_text_pri->pix(y), TEXT_PAD, 4);
+			std::fill_n(&m_text_pri->pix(y, TEXT_PAD + 640), TEXT_PAD, 4);
+		}
+	}
+}
+
+u32 namcos23_state::mix_text_pixel(u16 pen, u32 dst) const
+{
+	const c404_t &c404 = *m_pass_c404;
+	const u32 rgb = m_pass_pens[pen];
+	s32 r = (s32)((rgb >> 16) & 0xff);
+	s32 g = (s32)((rgb >> 8) & 0xff);
+	s32 b = (s32)(rgb & 0xff);
+
+	// apply fade
+	if ((c404.fade_flags & 2) && c404.screen_fade_factor)
+	{
+		const s32 fadefactor = 0xff - c404.screen_fade_factor;
+		const s32 fadefactor_inv = 0x100 - fadefactor;
+		r = ((r * fadefactor) + ((s32)c404.screen_fade_r * fadefactor_inv)) >> 8;
+		g = ((g * fadefactor) + ((s32)c404.screen_fade_g * fadefactor_inv)) >> 8;
+		b = ((b * fadefactor) + ((s32)c404.screen_fade_b * fadefactor_inv)) >> 8;
+	}
+
+	// apply alpha (the pen is compared as 8 bits, as in MAME's original text mixer)
+	const u8 pen8 = pen;
+	if (c404.alpha_factor && ((pen8 & 0xf) == c404.alpha_mask || (pen8 >= c404.alpha_check12 && pen8 <= c404.alpha_check13)))
+	{
+		const s32 alphafactor = 0xff - c404.alpha_factor;
+		const s32 alphafactor_inv = 0x100 - alphafactor;
+		const s32 dr = (s32)((dst >> 16) & 0xff);
+		const s32 dg = (s32)((dst >> 8) & 0xff);
+		const s32 db = (s32)(dst & 0xff);
+		r = ((r * alphafactor) + (dr * alphafactor_inv)) >> 8;
+		g = ((g * alphafactor) + (dg * alphafactor_inv)) >> 8;
+		b = ((b * alphafactor) + (db * alphafactor_inv)) >> 8;
+	}
+
+	return 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
+void *namcos23_state::screen_pass_work(void *param, int threadid)
+{
+	const screen_pass_band &band = *(const screen_pass_band *)param;
+	band.state->screen_pass(band);
+	return nullptr;
+}
+
+void namcos23_state::screen_pass(const screen_pass_band &band)
+{
+	// the text layer stays 640x480 and is scaled up here
+	const int scale = m_render_scale;
+	for (int y = band.min_y; y <= band.max_y; y++)
+	{
+		u32 *const dst = &band.bitmap->pix(y);
+		if (band.mode == PASS_PRESENT)
+		{
+			// frame drawn in the background during the last frame
+			std::copy_n(&m_back_bitmap.pix(y, band.min_x), band.max_x - band.min_x + 1, &dst[band.min_x]);
+			continue;
+		}
+
+		u8 *const pri = &band.pri->pix(y);
+		u16 const *const text = &m_mix_bitmap->pix(y / scale);
+		u8 const *const textpri = &m_text_pri->pix(y / scale);
+		if (band.mode == PASS_BACKGROUND)
+		{
+			// background color, text priority, and text that is not under a poly/sprite
+			for (int x = band.min_x; x <= band.max_x; x++)
+			{
+				dst[x] = m_frame_bgcolor;
+				pri[x] = 0;
+				if (m_text_enabled)
+				{
+					const int nx = m_render_xmap[x];
+					pri[x] = textpri[nx];
+					if (pri[x] == 4)
+						dst[x] = mix_text_pixel(text[nx], dst[x]);
+				}
+			}
+		}
+		else
+		{
+			for (int x = band.min_x; x <= band.max_x; x++)
+			{
+				// text over poly/sprite
+				if (m_text_enabled && pri[x] == 6)
+					dst[x] = mix_text_pixel(text[m_render_xmap[x]], dst[x]);
+
+				// Black Level setting: the darkest levels go to black before the gamma ramp
+				if (m_render_black)
+				{
+					const rgb_t color = dst[x];
+					dst[x] = rgb_t(m_black_lut[color.r()], m_black_lut[color.g()], m_black_lut[color.b()]);
 				}
 
-				// apply alpha
-				if (m_c404.alpha_factor && ((pen & 0xf) == m_c404.alpha_mask || (pen >= m_c404.alpha_check12 && pen <= m_c404.alpha_check13)))
-				{
-					const u32 drgb = *dst;
-					const s32 dr = (s32)((drgb >> 16) & 0xff);
-					const s32 dg = (s32)((drgb >> 8) & 0xff);
-					const s32 db = (s32)(drgb & 0xff);
-					r = ((r * alphafactor) + (dr * alphafactor_inv)) >> 8;
-					g = ((g * alphafactor) + (dg * alphafactor_inv)) >> 8;
-					b = ((b * alphafactor) + (db * alphafactor_inv)) >> 8;
-				}
-
-				*dst = 0xff000000 | (r << 16) | (g << 8) | b;
+				// C404 gamma correction follows lighting, fading and layer blending
+				// (can be switched off: the darker look closer to the original CRT and TeknoParrot)
+				if (!m_render_gamma)
+					continue;
+				const rgb_t color = dst[x];
+				const u8 r = m_pass_c404->ram[0x100 + color.r()];
+				const u8 g = m_pass_c404->ram[0x200 + color.g()];
+				const u8 b = m_pass_c404->ram[0x300 + color.b()];
+				dst[x] = rgb_t(r, g, b);
 			}
 		}
 	}
+}
+
+void namcos23_state::run_screen_pass(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect, int mode)
+{
+	const int rows = cliprect.height();
+	const int count = std::clamp(rows / 16, 1, 64);
+	m_pass_bands.resize(count);
+	for (int i = 0; i < count; i++)
+	{
+		screen_pass_band &band = m_pass_bands[i];
+		band.state = this;
+		band.bitmap = &bitmap;
+		band.pri = &primap;
+		band.min_x = cliprect.min_x;
+		band.max_x = cliprect.max_x;
+		band.min_y = cliprect.min_y + rows * i / count;
+		band.max_y = cliprect.min_y + rows * (i + 1) / count - 1;
+		band.mode = mode;
+	}
+	osd_work_item_queue_multiple(m_pass_queue, screen_pass_work, count, &m_pass_bands[0], sizeof(screen_pass_band), WORK_ITEM_FLAG_AUTO_RELEASE);
+
+	// A worker that runs out of items wakes the waiter even while others are still busy
+	// (only high-frequency queues spin until done), so wait until every band has finished.
+	while (!osd_work_queue_wait(m_pass_queue, osd_ticks_per_second() * 10)) { }
 }
 
 u32 gorgon_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
@@ -4987,8 +5644,40 @@ u32 gorgon_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, con
 	return namcos23_state::screen_update(screen, bitmap, cliprect);
 }
 
+void *namcos23_state::frame_work(void *param, int threadid)
+{
+	namcos23_state &state = *(namcos23_state *)param;
+	state.draw_frame(state.m_back_bitmap, state.m_back_pri, state.m_back_bitmap.cliprect());
+	return nullptr;
+}
+
+void namcos23_state::draw_frame(bitmap_rgb32 &bitmap, bitmap_ind8 &primap, const rectangle &cliprect)
+{
+	// background, priority and text layer (where no poly/sprite covers it)
+	run_screen_pass(bitmap, primap, cliprect, PASS_BACKGROUND);
+
+	if (m_render.poly_count)
+		render_bands(bitmap, primap);
+
+	// text over polys/sprites and gamma correction
+	run_screen_pass(bitmap, primap, cliprect, PASS_FINAL);
+}
+
+void namcos23_state::finish_background_frame()
+{
+	if (!m_frame_pending)
+		return;
+	while (!osd_work_queue_wait(m_frame_queue, osd_ticks_per_second() * 10)) { }
+	m_frame_pending = false;
+	m_back_valid = true;
+	m_render.poly_count = 0;
+}
+
 u32 namcos23_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
+	// a frame still drawn in the background uses the poly list, the text layer and the copies
+	finish_background_frame();
+
 	if (machine().video().skip_this_frame())
 	{
 		m_render.cur = !m_render.cur;
@@ -4998,7 +5687,6 @@ u32 namcos23_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		return UPDATE_HAS_NOT_CHANGED;
 	}
 
-	screen.priority().fill(0, cliprect);
 
 	// background color
 	u32 bgcolor = 0xff000000;
@@ -5014,36 +5702,58 @@ u32 namcos23_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		bg_b = ((bg_b * scale1) + ((s32)m_c404.screen_fade_b * scale2)) >> 8;
 	}
 	bgcolor |= (bg_r << 16) | (bg_g << 8) | bg_b;
-	bitmap.fill(bgcolor, cliprect);
+	m_frame_bgcolor = bgcolor;
 
-	if (m_c404.layer_flags & 4)
+	m_text_enabled = m_c404.layer_flags & 4;
+	if (m_text_enabled)
 	{
 		apply_text_scroll();
-
 		draw_text_layer(screen);
-		mix_text_layer(screen, bitmap, cliprect, 4);
 	}
+
+	if (m_render_pipelined)
+	{
+		// show the frame drawn in the background during the last frame
+		if (m_back_valid && m_back_bitmap.cliprect().contains(cliprect))
+			run_screen_pass(bitmap, screen.priority(), cliprect, PASS_PRESENT);
+		else
+			bitmap.fill(0xff000000, cliprect);
+
+		// make the poly list now, draw it in the background
+		m_render_deferred = true;
+		render_run(screen, bitmap);
+		m_render_deferred = false;
+
+		// this frame: copy what the drawing reads and the game can change while the next frame runs
+		m_back_c404 = m_c404;
+		const pen_t *const pens = m_palette->pens();
+		std::copy_n(pens, m_palette->entries(), m_back_pens.get());
+		m_pass_c404 = &m_back_c404;
+		m_pass_pens = m_back_pens.get();
+		for (int i = 0; i < m_render.poly_count; i++)
+			m_render.polys[i].rd.pens = m_back_pens.get() + (m_render.polys[i].rd.pens - pens);
+
+		if (m_back_bitmap.width() != screen.visible_area().width() || m_back_bitmap.height() != screen.visible_area().height())
+		{
+			m_back_bitmap.allocate(screen.visible_area().width(), screen.visible_area().height());
+			m_back_pri.allocate(screen.visible_area().width(), screen.visible_area().height());
+			m_back_valid = false;
+		}
+		m_frame_pending = true;
+		osd_work_item_queue(m_frame_queue, frame_work, this, WORK_ITEM_FLAG_AUTO_RELEASE);
+		return 0;
+	}
+
+	m_pass_c404 = &m_c404;
+	m_pass_pens = m_palette->pens();
+
+	// background, priority and text layer (where no poly/sprite covers it)
+	run_screen_pass(bitmap, screen.priority(), cliprect, PASS_BACKGROUND);
 
 	render_run(screen, bitmap);
 
-	if (m_c404.layer_flags & 4)
-	{
-		mix_text_layer(screen, bitmap, cliprect, 6);
-	}
-
-	// C404 gamma correction follows lighting, fading and layer blending.
-	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
-	{
-		u32 *const dest = &bitmap.pix(y);
-		for (int x = cliprect.left(); x <= cliprect.right(); x++)
-		{
-			const rgb_t color = dest[x];
-			const u8 r = m_c404.ram[0x100 + color.r()];
-			const u8 g = m_c404.ram[0x200 + color.g()];
-			const u8 b = m_c404.ram[0x300 + color.b()];
-			dest[x] = rgb_t(r, g, b);
-		}
-	}
+	// text over polys/sprites and gamma correction
+	run_screen_pass(bitmap, screen.priority(), cliprect, PASS_FINAL);
 
 	return 0;
 }
@@ -5203,7 +5913,7 @@ void gorgon_state::vblank(int state)
 
 TIMER_CALLBACK_MEMBER(namcos23_state::subcpu_scanline_on_tick)
 {
-	if (m_screen->vpos() < 72)
+	if (native_vpos() < 72)
 		subcpu_irq1_update(ASSERT_LINE);
 }
 
@@ -5554,7 +6264,7 @@ void namcos23_state::update_text_rowscroll()
 	}
 
 	int scroll_x = (m_c404.xscroll - 0x35c) & 0x3ff;
-	int y = std::min(m_screen->vpos() + 4, 480); // +4 is a fudge factor, otherwise rowscrolls are 4 lines too early
+	int y = std::min(native_vpos() + 4, 480); // +4 is a fudge factor, otherwise rowscrolls are 4 lines too early
 
 	// save x scroll value until current scanline
 	for (int i = m_c404.lastrow; i < y; i++)
@@ -5590,13 +6300,13 @@ void namcos23_state::c361_irq_scanline_w(offs_t offset, u16 data)
 {
 	LOGMASKED(LOG_C361_IRQ, "%s: c361_irq_scanline_w: %04x\n", machine().describe_context(), data);
 	m_c361.scanline = (data & 0x1ff);
-	m_c361.timer->adjust(m_screen->time_until_pos(m_c361.scanline));
+	m_c361.timer->adjust(m_screen->time_until_pos(m_c361.scanline * m_render_scale));
 }
 
 u16 namcos23_state::c361_vpos_r()
 {
 	irq_update(m_main_irqcause & ~MAIN_C361_IRQ);
-	return (m_screen->vpos() * 2) | (m_screen->vblank() ? 1 : 0);
+	return (native_vpos() * 2) | (m_screen->vblank() ? 1 : 0);
 }
 
 u16 namcos23_state::c361_vblank_r()
@@ -6430,6 +7140,8 @@ void namcos23_state::s23h8rwmap(address_map &map)
 
 void namcos23_state::machine_start()
 {
+	m_native_frame_period = m_screen->frame_period();
+
 	save_item(NAME(m_c404.poly_fade_r));
 	save_item(NAME(m_c404.poly_fade_g));
 	save_item(NAME(m_c404.poly_fade_b));
@@ -6650,8 +7362,104 @@ void crszone_state::machine_start()
 	m_c450_irqnum = MIPS3_IRQ4;
 }
 
+void namcos23_state::apply_render_settings()
+{
+	finish_background_frame();
+	m_back_valid = false;
+
+	int scale = 1;
+	bool bilinear = false;
+	bool gamma = true;
+	bool pipelined = false;
+	bool wide = false;
+	bool depth = false;
+	bool tri_fix = false;
+	int black = 0;
+	if (m_render_cfg)
+	{
+		const ioport_value cfg = m_render_cfg->read();
+		scale = (cfg & 0x03) + 1;
+		bilinear = BIT(cfg, 4);
+		gamma = !BIT(cfg, 5);
+		pipelined = BIT(cfg, 6);
+		wide = BIT(cfg, 7);
+		depth = BIT(cfg, 8);
+		tri_fix = BIT(cfg, 9);
+		black = BIT(cfg, 10) ? BLACK_LEVEL : 0;
+	}
+
+	// environment overrides, for scripted comparisons
+	if (const char *const env = getenv("MAME_S23_SCALE"))
+		scale = std::clamp(atoi(env), 1, 4);
+	if (const char *const env = getenv("MAME_S23_BILINEAR"))
+		bilinear = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S23_NOGAMMA"))
+		gamma = atoi(env) == 0;
+	if (const char *const env = getenv("MAME_S23_PIPELINE"))
+		pipelined = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S23_WIDE"))
+		wide = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S23_DEPTH"))
+		depth = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S23_TRIFIX"))
+		tri_fix = atoi(env) != 0;
+	if (const char *const env = getenv("MAME_S23_BLACK"))
+		black = std::clamp(atoi(env), 0, 64);
+
+	m_render_bilinear = bilinear;
+	m_render_gamma = gamma;
+	m_render_pipelined = pipelined;
+	m_render_depth = depth;
+	m_render_tri_fix = tri_fix;
+	if (black != m_render_black)
+	{
+		m_render_black = black;
+		for (int i = 0; i < 256; i++)
+			m_black_lut[i] = (i <= black) ? 0 : ((i - black) * 255 + (255 - black) / 2) / (255 - black);
+	}
+	if (scale != m_render_scale || wide != m_render_wide)
+	{
+		// same frame time, scale times as many lines and pixels; widescreen adds WIDE_EXTRA
+		// pixels on each side, and doubles the line length so native pixel times stay whole
+		m_render_scale = scale;
+		m_render_wide = wide;
+		const int extra = wide ? WIDE_EXTRA : 0;
+		const int width = (HBSTART + 2 * extra) * scale;
+		m_render_wide_ofs = extra * scale;
+		const rectangle visarea(HBEND * scale, HBEND * scale + width - 1, VBEND * scale, VBSTART * scale - 1);
+		m_screen->configure((wide ? 2 * HTOTAL : HTOTAL) * scale, VTOTAL * scale, visarea, m_native_frame_period);
+
+		// text layer column of each screen column
+		m_render_xmap.resize(width);
+		for (int x = 0; x < width; x++)
+			m_render_xmap[x] = (x + (TEXT_PAD - extra) * scale) / scale; // TEXT_PAD + (x / scale - extra), rounded down
+	}
+
+	// the window follows the screen shape: pick the matching view of namcos23.lay when a view
+	// of the other shape is shown (MAME's own "Screen 0 Standard (4:3)" counts as 4:3), so
+	// other views that were chosen on purpose stay
+	const char *const view = wide ? "Widescreen (16:9)" : "Standard (4:3)";
+	const char *const other = wide ? "Standard (4:3)" : "Widescreen (16:9)";
+	for (render_target &target : machine().render().targets())
+	{
+		const char *const current = target.view_name(target.view());
+		if (!current || !strstr(current, other))
+			continue;
+		for (unsigned i = 0; target.view_name(i); i++)
+		{
+			if (!strcmp(target.view_name(i), view))
+			{
+				target.set_view(i);
+				break;
+			}
+		}
+	}
+}
+
 void namcos23_state::machine_reset()
 {
+	apply_render_settings();
+
 	m_absolute_priority = 0;
 	m_tx = 0;
 	m_ty = 0;
@@ -6682,8 +7490,13 @@ void namcos23_state::machine_reset()
 	m_subcpu->set_input_line(INPUT_LINE_RESET, ASSERT_LINE);
 	m_subcpu_running = false;
 
-	m_subcpu_scanline_on_timer->adjust(attotime::zero, 0, m_screen->scan_period());
-	m_subcpu_scanline_off_timer->adjust(m_screen->time_until_pos(0, 32), 0, m_screen->time_until_pos(0, 32) + m_screen->scan_period());
+	// timers run per 640x480 scanline, whatever the render scale: a native scanline is
+	// scale screen lines, and native pixel 32 of line 0 is screen pixel 32 * scale * scale
+	// (twice that in widescreen, whose lines are twice as long)
+	const attotime native_scan_period(0, m_native_frame_period.as_attoseconds() / VTOTAL); // truncated like screen_device::scan_period()
+	const int off_hpos = 32 * m_render_scale * m_render_scale * (m_render_wide ? 2 : 1);
+	m_subcpu_scanline_on_timer->adjust(attotime::zero, 0, native_scan_period);
+	m_subcpu_scanline_off_timer->adjust(m_screen->time_until_pos(0, off_hpos), 0, m_screen->time_until_pos(0, off_hpos) + native_scan_period);
 
 	m_jvs_sense = 1;
 	m_main_irqcause = 0;
@@ -6771,6 +7584,7 @@ void gorgon_state::gorgon(machine_config &config)
 	/* video hardware */
 	SCREEN(config, m_screen);
 	m_screen->set_raw(PIXEL_CLOCK, HTOTAL, HBEND, HBSTART, VTOTAL, VBEND, VBSTART);
+	config.set_default_layout(layout_namcos23); // 4:3 and 16:9 views for the Aspect Ratio setting
 	m_screen->set_screen_update(FUNC(gorgon_state::screen_update));
 	m_screen->screen_vblank().set(FUNC(gorgon_state::vblank));
 	m_screen->set_video_attributes(VIDEO_ALWAYS_UPDATE);
@@ -6851,6 +7665,7 @@ void namcos23_state::s23(machine_config &config)
 	/* video hardware */
 	SCREEN(config, m_screen);
 	m_screen->set_raw(PIXEL_CLOCK, HTOTAL, HBEND, HBSTART, VTOTAL, VBEND, VBSTART);
+	config.set_default_layout(layout_namcos23); // 4:3 and 16:9 views for the Aspect Ratio setting
 	m_screen->set_screen_update(FUNC(namcos23_state::screen_update));
 	m_screen->screen_vblank().set(FUNC(namcos23_state::vblank));
 	m_screen->set_video_attributes(VIDEO_ALWAYS_UPDATE);
@@ -6896,8 +7711,26 @@ void namcos23_state::configure_jvs(device_jvs_interface &io)
 	io.analog_input<6>().set_ioport("^^JVS_ANALOG_INPUT7");
 	io.analog_input<7>().set_ioport("^^JVS_ANALOG_INPUT8");
 	io.rotary_input<0>().set_ioport("^^JVS_ROTARY_INPUT1");
-	io.screen_position_x<0>().set_ioport("^^JVS_SCREEN_POSITION_INPUT_X1");
+	io.screen_position_x<0>().set(*this, FUNC(namcos23_state::gun_x_r));
 	io.screen_position_y<0>().set_ioport("^^JVS_SCREEN_POSITION_INPUT_Y1");
+}
+
+u16 namcos23_state::gun_x_r()
+{
+	const u16 x = m_gun_x.read_safe(0);
+	if (!m_render_wide || !m_gun_x)
+		return x;
+
+	// widescreen: MAME spreads the gun over the whole 16:9 screen, the game aims in the 4:3 middle
+	for (const ioport_field &field : m_gun_x->fields())
+	{
+		if (field.type() != IPT_LIGHTGUN_X)
+			continue;
+		const float mid = (field.minval() + field.maxval()) * 0.5f;
+		const float wide_x = mid + ((x & field.mask()) - mid) * float(HBSTART + 2 * WIDE_EXTRA) / HBSTART;
+		return (x & ~field.mask()) | std::clamp<s32>(std::lround(wide_x), 0, field.mask());
+	}
+	return x;
 }
 
 void namcos23_state::downhill(machine_config &config)
@@ -7092,6 +7925,34 @@ static INPUT_PORTS_START(s23)
 
 	PORT_START("JVS_SCREEN_POSITION_INPUT_Y1")
 	PORT_BIT(0xffff, 0x0000, IPT_UNUSED)
+
+	PORT_START("RENDER") // enhancements, not hardware; applied on reset
+	PORT_CONFNAME(0x03, 0x00, "Internal Resolution")
+	PORT_CONFSETTING(   0x00, "1x (640x480, original)")
+	PORT_CONFSETTING(   0x01, "2x (1280x960)")
+	PORT_CONFSETTING(   0x02, "3x (1920x1440)")
+	PORT_CONFSETTING(   0x03, "4x (2560x1920)")
+	PORT_CONFNAME(0x10, 0x00, "Texture Filtering")
+	PORT_CONFSETTING(   0x00, "Off (original)")
+	PORT_CONFSETTING(   0x10, "Bilinear")
+	PORT_CONFNAME(0x20, 0x00, "Gamma Ramp")
+	PORT_CONFSETTING(   0x00, "Game (MAME)")
+	PORT_CONFSETTING(   0x20, "Off (darker, like TeknoParrot)")
+	PORT_CONFNAME(0x40, 0x00, "Rendering")
+	PORT_CONFSETTING(   0x00, "Same frame (original)")
+	PORT_CONFSETTING(   0x40, "One frame behind (faster, +1 frame delay)")
+	PORT_CONFNAME(0x80, 0x00, "Aspect Ratio")
+	PORT_CONFSETTING(   0x00, "4:3 (original)")
+	PORT_CONFSETTING(   0x80, "16:9 (widescreen)")
+	PORT_CONFNAME(0x100, 0x000, "Depth Test")
+	PORT_CONFSETTING(    0x000, "Off (MAME)")
+	PORT_CONFSETTING(    0x100, "On (fewer see-through walls)")
+	PORT_CONFNAME(0x200, 0x000, "Triangle Fix")
+	PORT_CONFSETTING(    0x000, "Off (MAME)")
+	PORT_CONFSETTING(    0x200, "On (no flickering back faces)")
+	PORT_CONFNAME(0x400, 0x000, "Black Level")
+	PORT_CONFSETTING(    0x000, "Game (MAME)")
+	PORT_CONFSETTING(    0x400, "Deeper (2 levels darker, like TeknoParrot)")
 INPUT_PORTS_END
 
 static INPUT_PORTS_START(gorgon)

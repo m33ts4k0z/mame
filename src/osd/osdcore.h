@@ -137,7 +137,7 @@ void osd_sleep(osd_ticks_t duration) noexcept;
 
 /* this is the maximum number of supported threads for a single work queue */
 /* threadid values are expected to range from 0..WORK_MAX_THREADS-1 */
-#define WORK_MAX_THREADS            16
+#define WORK_MAX_THREADS            32
 
 /* these flags can be set when creating a queue to give hints to the code about
    how to configure the queue */
