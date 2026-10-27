@@ -1766,7 +1766,11 @@ public:
 		m_sub_port8(0),
 		m_sub_porta(0),
 		m_sub_portb(0),
-		m_lamps(*this, "lamp%u", 0U)
+		m_lamps(*this, "lamp%u", 0U),
+		m_jvs_out(*this, "jvsout%u", 0U),
+		m_life_out(*this, "P1_Life"),
+		m_ammo_out(*this, "P1_Ammo"),
+		m_damaged_out(*this, "P1_Damaged")
 	{ }
 
 	~namcos23_state()
@@ -1782,6 +1786,8 @@ public:
 	void downhill(machine_config &config) ATTR_COLD;
 	void panicprk(machine_config &config) ATTR_COLD;
 
+	void init_timecrs2() ATTR_COLD;
+
 	render_t m_render;
 	const u8 *m_sprrom;
 
@@ -1791,11 +1797,13 @@ public:
 	bool m_render_bilinear = false;
 	bool m_render_gamma = true; // apply the C404 gamma ramp uploaded by the game
 	// Widescreen: the screen is WIDE_EXTRA 640x480 pixels wider on each side (854x480, 16:9).
-	// Full-width 3D viewports fill it, edge-to-edge text rows (cinema bars, fades) are extended
-	// (see extend_text_rows), and the HUD and sprites stay 4:3 in the middle.
+	// Full-width 3D viewports fill it, a text layer that covers the whole picture (fades) is
+	// extended, cinema bars and text boxes too with m_render_wide_bars (see extend_text_rows),
+	// and the HUD and sprites stay 4:3 in the middle.
 	static constexpr int WIDE_EXTRA = 107;
 	bool m_render_wide = false;
 	s32 m_render_wide_ofs = 0; // WIDE_EXTRA at the render scale, 0 when 4:3
+	bool m_render_wide_bars = false; // setting: bars to the screen edges (else 4:3 like TeknoParrot)
 	bool m_render_depth = false; // depth test on top of the poly sort (see namcos23_render_data::depth_test)
 	bool m_render_tri_fix = false; // back-face cull triangles on their own corners (see render_model)
 
@@ -1837,6 +1845,7 @@ protected:
 
 	virtual void configure_jvs(device_jvs_interface &io);
 	u16 gun_x_r();
+	void jvs_output_w(offs_t offset, u64 data, u64 mem_mask);
 
 	void irq_update_common(u32 cause);
 	virtual void irq_update(u32 cause);
@@ -2135,6 +2144,16 @@ protected:
 	u8 m_sub_porta;
 	u8 m_sub_portb;
 	output_finder<8> m_lamps;
+	output_finder<16> m_jvs_out; // I/O board general outputs (gun solenoid, lamps)
+
+	// gun feedback from main RAM (see feedback_vblank), Time Crisis II US TSS3 Ver.B only
+	bool m_feedback = false;
+	int m_prev_life = -1;
+	int m_damaged_frames = 0;
+	output_finder<> m_life_out;
+	output_finder<> m_ammo_out;
+	output_finder<> m_damaged_out;
+	void feedback_vblank();
 };
 
 class gorgon_state : public namcos23_state
@@ -4702,7 +4721,7 @@ void namcos23_renderer::render_flush(screen_device &screen, bitmap_rgb32 &bitmap
 		// screen edge in 4:3, a line in the middle of the screen here), so keep sampling
 		// within the texels the corners cover.
 		namcos23_render_data &rd = render.poly_order[i]->rd;
-		if (m_state.m_render_wide && !rd.sprite && !rd.direct)
+		if (m_state.m_render_wide && m_state.m_render_wide_bars && !rd.sprite && !rd.direct)
 			widen_screen_overlay(*render.poly_order[i]);
 		// (not for polys the game sorts on their nearest or farthest point, h bits 8-9 = 0 or 1:
 		// it uses those to keep effects like the clouds behind, or things in front)
@@ -4742,10 +4761,10 @@ void namcos23_renderer::render_flush(screen_device &screen, bitmap_rgb32 &bitmap
 	}
 }
 
-// Widescreen: the game frames its character introductions with black bars that are flat 3D
-// rectangles just wider than the 4:3 screen (x -24.9 to 664.9 in timecrs2). A rectangle like
-// that, facing the screen with both side edges just outside the 4:3 picture, is stretched to
-// the widescreen edges; real scenery is never that exact.
+// Widescreen with full-width bars: the game frames its character introductions with black bars
+// that are flat 3D rectangles just wider than the 4:3 screen (x -24.9 to 664.9 in timecrs2). A
+// rectangle like that, facing the screen with both side edges just outside the 4:3 picture, is
+// stretched to the widescreen edges; real scenery is never that exact.
 void namcos23_renderer::widen_screen_overlay(namcos23_poly_entry &p)
 {
 	const namcos23_render_data &rd = p.rd;
@@ -5417,7 +5436,9 @@ void namcos23_state::draw_text_layer(screen_device &screen)
 // with banner letters at the edges uses the nearest one-colour tile row of the same bar; failing
 // that, its most common colour (at least half), kept from frame to frame while it still covers
 // a quarter, so letters passing both edges cannot turn the row white. The banner letters stay
-// in the 4:3 middle.
+// in the 4:3 middle. Without m_render_wide_bars only a text layer covering the whole picture
+// (a fade, a 2D screen) is extended; bars and boxes stay 4:3 with the 3D beside them, as in
+// TeknoParrot.
 void namcos23_state::extend_text_rows()
 {
 	struct block_t
@@ -5465,6 +5486,12 @@ void namcos23_state::extend_text_rows()
 			}
 		}
 		y0 = b.y1;
+	}
+
+	if (!m_render_wide_bars && !std::all_of(blocks.begin(), blocks.begin() + count, [] (const block_t &b) { return b.covered; }))
+	{
+		m_text_side_pen.fill(NO_PEN);
+		return;
 	}
 
 	for (int k = 0; k < count; k++)
@@ -5896,6 +5923,8 @@ void namcos23_state::vblank(int state)
 	{
 		m_ctl_vbl_active = true;
 		irq_update(m_main_irqcause | MAIN_VBLANK_IRQ);
+		if (m_feedback)
+			feedback_vblank();
 	}
 	else
 	{
@@ -5903,6 +5932,30 @@ void namcos23_state::vblank(int state)
 	}
 	m_sub_portb = (m_sub_portb & 0x7f) | (state << 7);
 	m_adc->adtrg_w(state);
+}
+
+// Gun feedback outputs for Time Crisis II (US TSS3 Ver.B, as found in its main RAM): P1_Life
+// (lives left, 4 at the start by default) and P1_Ammo (bullets in the gun, 9 when full), and
+// P1_Damaged, on for 10 frames when a life is lost (on top of the I/O board's own outputs; the
+// gun solenoid is jvsout7). They are meant for force feedback through the network output (e.g.
+// QMamehook).
+void namcos23_state::feedback_vblank()
+{
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+	const int life = space.read_byte(0x2f4401);
+	m_life_out = life;
+	m_ammo_out = space.read_byte(0x2f43ff);
+	if (life == m_prev_life - 1)
+		m_damaged_frames = 10;
+	m_prev_life = life;
+	m_damaged_out = m_damaged_frames > 0;
+	if (m_damaged_frames > 0)
+		m_damaged_frames--;
+}
+
+void namcos23_state::init_timecrs2()
+{
+	m_feedback = true;
 }
 
 void gorgon_state::vblank(int state)
@@ -7375,6 +7428,7 @@ void namcos23_state::apply_render_settings()
 	bool depth = false;
 	bool tri_fix = false;
 	int black = 0;
+	bool wide_bars = false;
 	if (m_render_cfg)
 	{
 		const ioport_value cfg = m_render_cfg->read();
@@ -7386,6 +7440,7 @@ void namcos23_state::apply_render_settings()
 		depth = BIT(cfg, 8);
 		tri_fix = BIT(cfg, 9);
 		black = BIT(cfg, 10) ? BLACK_LEVEL : 0;
+		wide_bars = BIT(cfg, 11);
 	}
 
 	// environment overrides, for scripted comparisons
@@ -7405,7 +7460,10 @@ void namcos23_state::apply_render_settings()
 		tri_fix = atoi(env) != 0;
 	if (const char *const env = getenv("MAME_S23_BLACK"))
 		black = std::clamp(atoi(env), 0, 64);
+	if (const char *const env = getenv("MAME_S23_WIDEBARS"))
+		wide_bars = atoi(env) != 0;
 
+	m_render_wide_bars = wide_bars;
 	m_render_bilinear = bilinear;
 	m_render_gamma = gamma;
 	m_render_pipelined = pipelined;
@@ -7508,6 +7566,8 @@ void namcos23_state::machine_reset()
 	m_subcpu_running = false;
 	m_render.count[0] = m_render.count[1] = 0;
 	m_render.cur = 0;
+	m_prev_life = -1;
+	m_damaged_frames = 0;
 }
 
 void gorgon_state::machine_reset()
@@ -7713,6 +7773,14 @@ void namcos23_state::configure_jvs(device_jvs_interface &io)
 	io.rotary_input<0>().set_ioport("^^JVS_ROTARY_INPUT1");
 	io.screen_position_x<0>().set(*this, FUNC(namcos23_state::gun_x_r));
 	io.screen_position_y<0>().set_ioport("^^JVS_SCREEN_POSITION_INPUT_Y1");
+	io.output().set(*this, FUNC(namcos23_state::jvs_output_w));
+}
+
+void namcos23_state::jvs_output_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	for (int i = 0; i < 16; i++)
+		if (BIT(mem_mask, i))
+			m_jvs_out[i] = BIT(data, i);
 }
 
 u16 namcos23_state::gun_x_r()
@@ -7721,14 +7789,20 @@ u16 namcos23_state::gun_x_r()
 	if (!m_render_wide || !m_gun_x)
 		return x;
 
-	// widescreen: MAME spreads the gun over the whole 16:9 screen, the game aims in the 4:3 middle
+	// widescreen: MAME spreads the gun over the whole 16:9 screen, the game aims in the 4:3 middle.
+	// The game turns a shot into a ray without limits on x (0x80090c88 / 0x800909a0 in
+	// timecrs2), so shots at the sides work; x 0 means off-screen to it, so a gun on the screen
+	// whose position falls below 0 here stays at 1 (only the left edge itself, which MAME reports
+	// for a gun pointing off the screen, gives 0)
 	for (const ioport_field &field : m_gun_x->fields())
 	{
 		if (field.type() != IPT_LIGHTGUN_X)
 			continue;
+		const s32 raw = x & field.mask();
 		const float mid = (field.minval() + field.maxval()) * 0.5f;
-		const float wide_x = mid + ((x & field.mask()) - mid) * float(HBSTART + 2 * WIDE_EXTRA) / HBSTART;
-		return (x & ~field.mask()) | std::clamp<s32>(std::lround(wide_x), 0, field.mask());
+		const float wide_x = mid + (raw - mid) * float(HBSTART + 2 * WIDE_EXTRA) / HBSTART;
+		const s32 low = (raw <= s32(field.minval())) ? 0 : 1;
+		return (x & ~field.mask()) | std::clamp<s32>(std::lround(wide_x), low, field.mask());
 	}
 	return x;
 }
@@ -7953,6 +8027,9 @@ static INPUT_PORTS_START(s23)
 	PORT_CONFNAME(0x400, 0x000, "Black Level")
 	PORT_CONFSETTING(    0x000, "Game (MAME)")
 	PORT_CONFSETTING(    0x400, "Deeper (2 levels darker, like TeknoParrot)")
+	PORT_CONFNAME(0x800, 0x000, "Widescreen Bars")
+	PORT_CONFSETTING(    0x000, "4:3 (3D beside them, like TeknoParrot)")
+	PORT_CONFSETTING(    0x800, "Full width")
 INPUT_PORTS_END
 
 static INPUT_PORTS_START(gorgon)
@@ -9857,7 +9934,9 @@ GAME( 1997, downhillu,   downhill, downhill,    downhill,  namcos23_state,      
 GAME( 1997, motoxgo,     0,        motoxgo,     motoxgo,   motoxgo_state,        empty_init,  ROT0, "Namco", "Motocross Go! (World, MG3 Ver. A)",     GAME_FLAGS | MACHINE_NODEVICE_LAN )
 GAME( 1997, motoxgov2a,  motoxgo,  motoxgo,     motoxgo,   motoxgo_state,        empty_init,  ROT0, "Namco", "Motocross Go! (US, MG2 Ver. A)",        GAME_FLAGS | MACHINE_NODEVICE_LAN )
 GAME( 1997, motoxgov1a,  motoxgo,  motoxgo,     motoxgo,   motoxgo_state,        empty_init,  ROT0, "Namco", "Motocross Go! (Japan, MG1 Ver. A)",     GAME_FLAGS | MACHINE_NODEVICE_LAN )
-GAME( 1997, timecrs2,    0,        timecrs2,    timecrs2,  namcos23_state,       empty_init,  ROT0, "Namco", "Time Crisis II (US, TSS3 Ver. B)",      GAME_FLAGS | MACHINE_NODEVICE_LAN )
+// timecrs2 (the set played with the enhancements and fixes of this branch) carries no warning flags
+// here; the LAN of the 2-player link cabinets is still not emulated (one player per cabinet works)
+GAME( 1997, timecrs2,    0,        timecrs2,    timecrs2,  namcos23_state,       init_timecrs2, ROT0, "Namco", "Time Crisis II (US, TSS3 Ver. B)",      MACHINE_SUPPORTS_SAVE )
 GAME( 1997, timecrs2v2b, timecrs2, timecrs2,    timecrs2,  namcos23_state,       empty_init,  ROT0, "Namco", "Time Crisis II (World, TSS2 Ver. B)",   GAME_FLAGS | MACHINE_NODEVICE_LAN )
 GAME( 1997, timecrs2v1b, timecrs2, timecrs2,    timecrs2,  namcos23_state,       empty_init,  ROT0, "Namco", "Time Crisis II (Japan, TSS1 Ver. B)",   GAME_FLAGS | MACHINE_NODEVICE_LAN )
 GAME( 1997, timecrs2v4a, timecrs2, timecrs2v4a, timecrs2,  namcoss23_state,      empty_init,  ROT0, "Namco", "Time Crisis II (World, TSS4 Ver. A)",   GAME_FLAGS | MACHINE_NODEVICE_LAN )
