@@ -1,3 +1,7 @@
+# Time Crisis enhancements
+
+Time Crisis (timecris) and Time Crisis II (timecrs2): TeknoParrot-like widescreen rendering with improved graphics, and all rendering issues fixed.
+
 # MAME
 
 ## What is MAME?
