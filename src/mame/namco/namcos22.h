@@ -731,15 +731,32 @@ class timecris_state : public namcos22s_state
 {
 public:
 	timecris_state(const machine_config &mconfig, device_type type, const char *tag) :
-		namcos22s_state(mconfig, type, tag)
+		namcos22s_state(mconfig, type, tag),
+		m_life_out(*this, "P1_Life"),
+		m_ammo_out(*this, "P1_Ammo"),
+		m_damaged_out(*this, "P1_Damaged")
 	{ }
 
 	void timecris(machine_config &config);
 	void init_timecris();
 
+protected:
+	virtual void machine_reset() override ATTR_COLD;
+
 private:
 	u16 gun_r(offs_t offset);
 	void timecris_am(address_map &map) ATTR_COLD;
+	bool patch_wide_gun(bool wide);
+	void feedback_vblank(int state);
+
+	bool m_wide_gun = false; // widescreen shots reach the sides (program patched, Ver.B only)
+	bool m_feedback = false; // gun feedback outputs (Ver.B only)
+	int m_prev_life = -1;
+	bool m_prev_flash = true;
+	int m_damaged_frames = 0;
+	output_finder<> m_life_out;
+	output_finder<> m_ammo_out;
+	output_finder<> m_damaged_out;
 };
 
 class propcycl_state : public namcos22s_state

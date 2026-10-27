@@ -1912,10 +1912,13 @@ u16 timecris_state::gun_r(offs_t offset)
 	else if (m_render_wide)
 	{
 		// widescreen: MAME spreads the gun over the whole 16:9 screen, the game aims in the 4:3
-		// middle; the sides are off-screen
+		// middle; the sides are off-screen unless the program takes shots there (patch_wide_gun),
+		// then they go through as positions beyond the 4:3 edges (below xmin as negative words)
 		const float mid = (xmin + xmax) * 0.5f;
 		const int x = std::lround(mid + (xpos - mid) * float(HBSTART + 2 * WIDE_EXTRA) / HBSTART);
-		if (x <= xmin || x >= xmax)
+		if (m_wide_gun)
+			xpos = u16(x);
+		else if (x <= xmin || x >= xmax)
 			xpos = ypos = 0;
 		else
 			xpos = x;
@@ -4025,6 +4028,7 @@ void timecris_state::timecris(machine_config &config)
 	namcos22s(config);
 
 	m_maincpu->set_addrmap(AS_PROGRAM, &timecris_state::timecris_am);
+	m_screen->screen_vblank().append(FUNC(timecris_state::feedback_vblank));
 	config.set_default_layout(layout_namcos22); // 4:3 and 16:9 views for the Aspect Ratio setting
 }
 
@@ -6488,6 +6492,78 @@ void timecris_state::init_timecris()
 	install_130_speedup();
 }
 
+// Widescreen shots for Time Crisis (Ver.B program): the game projects enemies with a fixed 4:3
+// focal length and tests a shot by its distance to them on that 640x480 screen (0xb18a), so in
+// 16:9 the sides lie beyond x 0..639. Its gun routine (0x932e) clamps x to 0..639; the patch
+// lets it run from -107 to 747. The scenery depth map a shot also looks up (0x248b4, 160x120
+// cells of the 4:3 screen, decides whether a wall is in front of the enemy) has no cells there,
+// so a routine in the empty ROM at 0xbf000 skips it for x outside 0..639. Words are patched only
+// when all of them hold the expected values, so other program versions keep 4:3 shooting; the
+// return value says whether the program is the Ver.B one.
+bool timecris_state::patch_wide_gun(bool wide)
+{
+	struct patch { offs_t offset; u32 original, patched; };
+	static const patch patches[] =
+	{
+		{ 0x093c4, 0x01406a04, 0x01406004 }, // bpl.s 0x93cc -> bra.s: no clamp to 0
+		{ 0x093cc, 0x0c41027f, 0x0c4102eb }, // cmpi.w #$27f,d1 -> #$2eb
+		{ 0x093d0, 0x6304323c, 0x6f04323c }, // bls.s -> ble.s (signed)
+		{ 0x093d4, 0x027f3d41, 0x02eb3d41 }, // move.w #$27f,d1 -> #$2eb
+		{ 0x248cc, 0x322eba10, 0x4eb9000b }, // move.w (-$45f0,a6),d1 / move.w (-$45f2,a6),d0
+		{ 0x248d0, 0x302eba0e, 0xf0004e71 }, //   -> jsr $bf000.l / nop
+		{ 0xbf000, 0xffffffff, 0x322eba10 }, // move.w (-$45f0,a6),d1
+		{ 0xbf004, 0xffffffff, 0x302eba0e }, // move.w (-$45f2,a6),d0
+		{ 0xbf008, 0xffffffff, 0x0c40027f }, // cmpi.w #$27f,d0
+		{ 0xbf00c, 0xffffffff, 0x62024e75 }, // bhi.s +2 (x outside 0..639) / rts
+		{ 0xbf010, 0xffffffff, 0x588f4ef9 }, // addq.l #4,a7 / jmp
+		{ 0xbf014, 0xffffffff, 0x0002489e }, //   $2489e.l (no depth: clear and return)
+	};
+
+	u32 *const rom = (u32 *)memregion("maincpu")->base();
+	for (const patch &p : patches)
+		if (rom[p.offset / 4] != p.original && rom[p.offset / 4] != p.patched)
+			return false;
+	for (const patch &p : patches)
+		rom[p.offset / 4] = wide ? p.patched : p.original;
+	return true;
+}
+
+// Gun feedback outputs, Ver.B program only (as found in its work RAM): P1_Life (lives left, 3 at
+// the start by default) and P1_Ammo (bullets in the gun, 6 when full), and P1_Damaged, on for 10
+// frames when the player is shot (on top of the hardware's own outputs; the gun solenoid is
+// mcuout1). They are meant for force feedback through the network output (e.g. QMamehook).
+// Being shot flashes the screen red, often without costing a life: the full-screen flash flag
+// (0xe0d151) switches on while the player is in action (0xe0d14d) and the flash is not a white
+// fade (0xe0d153, also used for the stage cards and the game over). A lost life counts too.
+void timecris_state::feedback_vblank(int state)
+{
+	if (!state || !m_feedback)
+		return;
+
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+	const int life = space.read_byte(0xe00791);
+	m_life_out = life;
+	m_ammo_out = space.read_byte(0xe00793);
+	const bool flash = space.read_byte(0xe0d151) == 0xff;
+	if (life == m_prev_life - 1 || (flash && !m_prev_flash && space.read_byte(0xe0d14d) == 0xff && space.read_byte(0xe0d153) == 0))
+		m_damaged_frames = 10;
+	m_prev_life = life;
+	m_prev_flash = flash;
+	m_damaged_out = m_damaged_frames > 0;
+	if (m_damaged_frames > 0)
+		m_damaged_frames--;
+}
+
+void timecris_state::machine_reset()
+{
+	namcos22s_state::machine_reset();
+	m_feedback = patch_wide_gun(m_render_wide);
+	m_wide_gun = m_feedback && m_render_wide;
+	m_prev_life = -1;
+	m_prev_flash = true;
+	m_damaged_frames = 0;
+}
+
 void namcos22s_state::init_tokyowar()
 {
 	m_gametype = NAMCOS22_TOKYO_WARS;
@@ -6549,7 +6625,9 @@ GAME( 1995, dirtdash,   0,        dirtdash,  dirtdash,  namcos22s_state,  init_d
 GAME( 1995, dirtdasha,  dirtdash, dirtdash,  dirtdash,  namcos22s_state,  init_dirtdash,  ROT0, "Namco", "Dirt Dash (World, DT2 Ver.A)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 95/12/20 20:01:56
 GAME( 1995, dirtdashb,  dirtdash, dirtdash,  dirtdash,  namcos22s_state,  init_dirtdash,  ROT0, "Namco", "Dirt Dash (World, DT2 Ver.B)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 96/01/08 21:03:46
 GAME( 1995, dirtdashj,  dirtdash, dirtdash,  dirtdash,  namcos22s_state,  init_dirtdash,  ROT0, "Namco", "Dirt Dash (Japan, DT1 Ver.A)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 95/12/20 20:06:45
-GAME( 1996, timecris,   0,        timecris,  timecris,  timecris_state,   init_timecris,  ROT0, "Namco", "Time Crisis (World, TS2 Ver.B)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 96/04/02 18:48:00
+// timecris (the Ver.B set, the one played with the enhancements of this branch: resolution, 16:9,
+// widescreen gun, feedback outputs) carries no warning flags here
+GAME( 1996, timecris,   0,        timecris,  timecris,  timecris_state,   init_timecris,  ROT0, "Namco", "Time Crisis (World, TS2 Ver.B)", MACHINE_SUPPORTS_SAVE ) // 96/04/02 18:48:00
 GAME( 1996, timecrisa,  timecris, timecris,  timecris,  timecris_state,   init_timecris,  ROT0, "Namco", "Time Crisis (World, TS2 Ver.A)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 96/01/08 18:56:09
 GAME( 1996, timecrisj,  timecris, timecris,  timecris,  timecris_state,   init_timecris,  ROT0, "Namco", "Time Crisis (Japan, TS1 Ver.B)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 96/04/02 16:54:41
 GAME( 1996, propcycl,   0,        propcycl,  propcycl,  propcycl_state,   init_propcycl,  ROT0, "Namco", "Prop Cycle (World, PR2 Ver.A)", MACHINE_SUPPORTS_SAVE | MACHINE_IMPERFECT_GRAPHICS ) // 96/06/18 21:22:13
